@@ -78,6 +78,21 @@ const HELPERS = `
     }
     return partial;
   };
+  var selectOptionLabel = function (option) {
+    var explicit = option.getAttribute('label');
+    if (explicit !== null) return explicit;
+    return String(option.textContent || '').replace(/\\s+/g, ' ').trim();
+  };
+  var isOptionDisabled = function (element) {
+    if (element.disabled === true) return true;
+    if (typeof element.matches === 'function' && element.matches(':disabled')) return true;
+    var parent = element.parentElement;
+    while (parent) {
+      if (parent.tagName === 'OPTGROUP' && parent.disabled === true) return true;
+      parent = parent.parentElement;
+    }
+    return false;
+  };
 `;
 
 export const wrapPageScript = (body) => `(() => {\n${HELPERS}\n${body}\n})()`;
@@ -169,3 +184,45 @@ export const buildTypeScript = ({ selector, value, submit }) => wrapPageScript(`
   }
   return { ok: true, selector: cssPath(target), url: String(location.href) };
 `);
+
+export const buildSelectScript = (parameters = {}) => {
+  const hasLabel = parameters.label !== undefined;
+  const hasValue = parameters.value !== undefined;
+  const criterion = hasLabel === hasValue ? '' : hasLabel ? 'label' : 'value';
+  const wanted = hasLabel ? parameters.label : parameters.value;
+  return wrapPageScript(`
+  var selector = ${JSON.stringify(parameters.selector)};
+  var criterion = ${JSON.stringify(criterion)};
+  var wanted = ${JSON.stringify(wanted)};
+  if (!criterion) return { ok: false, error: 'browser.select requires exactly one of label or value' };
+
+  var target = null;
+  try { target = document.querySelector(selector); }
+  catch (error) { return { ok: false, error: 'Invalid selector: ' + selector }; }
+  if (!target) return { ok: false, error: 'No element matches ' + selector };
+  if (!(target instanceof window.HTMLSelectElement)) return { ok: false, error: selector + ' is not a native HTML select' };
+  if (isOptionDisabled(target)) return { ok: false, error: 'The select ' + selector + ' is disabled' };
+  if (target.multiple) return { ok: false, error: 'Multiple selects are not supported for browser.select' };
+
+  var matches = [];
+  for (var i = 0; i < target.options.length; i += 1) {
+    var option = target.options[i];
+    var candidate = criterion === 'label' ? selectOptionLabel(option) : String(option.value);
+    if (candidate === wanted) matches.push(option);
+  }
+  if (matches.length === 0) return { ok: false, error: 'No option in ' + selector + ' has the exact ' + criterion + ' ' + wanted };
+  if (matches.length > 1) return { ok: false, error: 'More than one option in ' + selector + ' has the exact ' + criterion + ' ' + wanted };
+  var match = matches[0];
+  if (isOptionDisabled(match)) return { ok: false, error: 'The matching option in ' + selector + ' is disabled' };
+
+  target.scrollIntoView({ block: 'center' });
+  for (var j = 0; j < target.options.length; j += 1) target.options[j].selected = target.options[j] === match;
+  var selected = target.selectedOptions;
+  if (selected.length !== 1 || selected[0] !== match || target.value !== match.value) {
+    return { ok: false, error: 'The option in ' + selector + ' could not be selected' };
+  }
+  target.dispatchEvent(new Event('input', { bubbles: true }));
+  target.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, selector: cssPath(target), label: selectOptionLabel(match), value: String(target.value), url: String(location.href) };
+`);
+};

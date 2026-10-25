@@ -422,6 +422,20 @@ export const createBrowserRuntime = ({
     return pageOf(await openTab({ background: true }));
   };
 
+  // Closing names an existing tab from browser.snapshot, or the tab the viewer
+  // sees. It never creates one, and it never reaches another chat's runtime.
+  runtime.agentCloseTab = async (tabId) => {
+    const current = tabId === undefined ? activeTab() : tabs.get(tabId);
+    if (!current) {
+      throw new Error(tabId === undefined
+        ? 'This chat has no browser tab to close. Open a page with browser.open first.'
+        : `This chat's browser has no tab ${JSON.stringify(String(tabId))}. Use an id from browser.snapshot's tabs.`);
+    }
+    await cdp.send('Target.closeTarget', { targetId: current.targetId });
+    removeTab(current.targetId);
+    return { closed: true, tabId: current.targetId };
+  };
+
   // The active tab decides; other tabs follow on a best-effort basis.
   runtime.setNativeSelectCompatibility = async (enabled) => {
     await runtime.ensurePage();

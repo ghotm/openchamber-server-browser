@@ -43,6 +43,26 @@ const startWebFixture = async () => {
         <select id="native"><option>One</option><option>Two</option></select>
         <select id="listbox" size="2"><option>One</option><option>Two</option></select>
         <button id="custom" role="combobox">Custom menu</button>
+        <select id="rich">
+          <option value="a" label="Alpha explicit">Ignored text</option>
+          <option value="b">Beta</option>
+          <option value="c" disabled>Gamma</option>
+          <optgroup label="Group" disabled><option value="d">Delta</option></optgroup>
+        </select>
+        <select id="multi" multiple><option value="x">X</option><option value="y">Y</option></select>
+        <select id="dupes">
+          <option value="1" label="Same">One</option>
+          <option value="2" label="Same">Two</option>
+        </select>
+        <select id="empty-label"><option value="e" label="">Empty label</option></select>
+        <select id="disabled-select" disabled><option value="f">Foo</option></select>
+        <select id="evented"><option value="one">One</option><option value="two">Two</option></select>
+        <script>
+          window.selectEvents = { input: 0, change: 0 };
+          const evented = document.querySelector('#evented');
+          evented.addEventListener('input', () => { window.selectEvents.input += 1; });
+          evented.addEventListener('change', () => { window.selectEvents.change += 1; });
+        </script>
       `, 'Select compatibility'));
       return;
     }
@@ -687,4 +707,75 @@ test('captures console and network for the inspector and runs JavaScript in the 
   // When another tab comes forward, then this capture is gone.
   await runtime.command('tab-new');
   assert.throws(() => runtime.inspector.events(captureId, cursor), (error) => error.code === 'CAPTURE_GONE');
+});
+
+test('selects a native option by exact label or value', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page with explicit labels, disabled choices, duplicates, and a multi-select.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/selects` });
+
+  // When the agent selects by value or by the label attribute, then the page changes.
+  assert.deepEqual(await runtime.perform('browser.select', { selector: '#native', value: 'Two' }), {
+    selector: '#native', label: 'Two', value: 'Two', url: `${web.origin}/selects`,
+  });
+  assert.deepEqual(await runtime.perform('browser.select', { selector: '#rich', label: 'Alpha explicit' }), {
+    selector: '#rich', label: 'Alpha explicit', value: 'a', url: `${web.origin}/selects`,
+  });
+  assert.deepEqual(await runtime.perform('browser.select', { selector: '#empty-label', label: '' }), {
+    selector: '#empty-label', label: '', value: 'e', url: `${web.origin}/selects`,
+  });
+
+  // Then input and change reach listeners exactly once.
+  await runtime.perform('browser.select', { selector: '#evented', value: 'two' });
+  const page = await runtime.ensurePage();
+  const events = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression: 'JSON.stringify(window.selectEvents)',
+    returnByValue: true,
+  });
+  assert.equal(events.result.value, '{"input":1,"change":1}');
+
+  // But text that is not the label attribute does not match, and neither do ambiguous or unusable choices.
+  await assert.rejects(runtime.perform('browser.select', { selector: '#rich', label: 'Ignored text' }), /No option/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#rich', value: 'c' }), /matching option.*disabled/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#rich', value: 'd' }), /matching option.*disabled/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#disabled-select', value: 'f' }), /select.*disabled/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#multi', value: 'x' }), /Multiple selects/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#dupes', label: 'Same' }), /More than one option/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#native', value: 'Missing' }), /No option/);
+  await assert.rejects(runtime.perform('browser.select', { selector: 'input', value: 'Two' }), /not a native HTML select/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '[', value: 'Two' }), /Invalid selector/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#native' }), /exactly one of label or value/);
+  await assert.rejects(runtime.perform('browser.select', { selector: '#native', label: 'One', value: 'One' }), /exactly one of label or value/);
+});
+
+test('closes this chat\'s tabs without creating one', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a chat with no browser tab.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await assert.rejects(runtime.perform('browser.close', {}), /no browser tab to close/);
+
+  // When the chat opens two tabs, then close without an id closes the tab the viewer sees.
+  const first = await runtime.perform('browser.open', { url: `${web.origin}/` });
+  const second = await runtime.perform('browser.open', { url: `${web.origin}/next` });
+  assert.equal(runtime.tabs.length, 2);
+  assert.equal(runtime.tabs.find((tab) => tab.active).id, first.tabId);
+  assert.deepEqual(await runtime.perform('browser.close', {}), { closed: true, tabId: first.tabId });
+  assert.deepEqual(runtime.tabs.map((tab) => tab.id), [second.tabId]);
+  assert.equal(runtime.tabs[0].active, true);
+
+  // But an id from another browser is refused, and never replaced by a new tab.
+  await assert.rejects(runtime.perform('browser.close', { tabId: 'missing' }), /no tab "missing"/);
+  assert.equal(runtime.tabs.length, 1);
+
+  // When the last tab closes, then the browser still accepts the next open.
+  assert.deepEqual(await runtime.perform('browser.close', { tabId: second.tabId }), { closed: true, tabId: second.tabId });
+  assert.equal(runtime.tabs.length, 0);
+  await assert.rejects(runtime.perform('browser.close', {}), /no browser tab to close/);
+  const reopened = await runtime.perform('browser.open', { url: `${web.origin}/title` });
+  assert.equal(reopened.title, 'Title before');
 });
