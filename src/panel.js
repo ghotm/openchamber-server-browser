@@ -211,6 +211,178 @@ consoleList.setAttribute('role', 'log');
 consoleList.setAttribute('aria-label', 'Errors and warnings since this page loaded');
 consolePanel.append(consoleHeader, consoleList);
 
+const MARKS_HEIGHT = 180;
+const markButton = document.createElement('button');
+markButton.type = 'button';
+markButton.className = 'toolbar-button mark-button';
+markButton.setAttribute('aria-pressed', 'false');
+setIcon(markButton, (svg) => {
+  addPath(svg, 'M12 5a7 7 0 1 0 0 14a7 7 0 1 0 0-14');
+  addLine(svg, { x1: '12', y1: '2', x2: '12', y2: '6' });
+  addLine(svg, { x1: '12', y1: '18', x2: '12', y2: '22' });
+  addLine(svg, { x1: '2', y1: '12', x2: '6', y2: '12' });
+  addLine(svg, { x1: '18', y1: '12', x2: '22', y2: '12' });
+});
+
+const marksButton = document.createElement('button');
+marksButton.type = 'button';
+marksButton.className = 'marks-button';
+marksButton.textContent = 'Marks (0)';
+marksButton.hidden = true;
+marksButton.setAttribute('aria-controls', 'marks');
+marksButton.setAttribute('aria-expanded', 'false');
+
+const marksPanel = document.createElement('section');
+marksPanel.id = 'marks';
+marksPanel.className = 'marks';
+marksPanel.hidden = true;
+marksPanel.setAttribute('aria-label', 'Marked elements on this tab');
+const marksHeader = document.createElement('p');
+marksHeader.className = 'marks-header';
+marksHeader.textContent = 'Marked elements on this tab. After you hand control back, the agent reads them with browser.snapshot.';
+const marksList = document.createElement('ol');
+marksList.className = 'marks-list';
+const marksFooter = document.createElement('div');
+marksFooter.className = 'marks-footer';
+const copyHint = document.createElement('button');
+copyHint.type = 'button';
+copyHint.className = 'marks-action';
+copyHint.textContent = 'Copy hint';
+const clearMarks = document.createElement('button');
+clearMarks.type = 'button';
+clearMarks.className = 'marks-action';
+clearMarks.textContent = 'Clear all';
+marksFooter.append(copyHint, clearMarks);
+marksPanel.append(marksHeader, marksList, marksFooter);
+
+let marksOpen = false;
+let marksSignature = '';
+
+const markPath = (mark) => {
+  const frames = Array.isArray(mark.frameSelectors) ? mark.frameSelectors : [];
+  const shadowPath = Array.isArray(mark.shadowPath) ? mark.shadowPath : [];
+  const target = shadowPath.length > 0
+    ? shadowPath.join(' >>> ')
+    : mark.shadowHostSelector && mark.shadowSelector
+      ? `${mark.shadowHostSelector} >>> ${mark.shadowSelector}`
+      : mark.selector || mark.tag;
+  return frames.length > 0 ? `${frames.join(' >>> ')} >>> ${target}` : target;
+};
+
+const markHint = (marks) => {
+  const count = marks.length;
+  return [
+    `I marked ${count} element${count === 1 ? '' : 's'} in the shared browser. Call openchamber_web browser.snapshot and read the marks list.`,
+    '',
+    ...marks.map((mark, index) => {
+      const target = markPath(mark);
+      const label = mark.name || mark.text;
+      return `${index + 1}. ${label ? `${target} "${label}"` : target}`;
+    }),
+  ].join('\n');
+};
+
+const renderMarks = (selected) => {
+  const marks = state?.mark?.marks ?? [];
+  const hasTab = selected?.tabs?.some((tab) => tab.active) === true;
+  marksButton.hidden = !selected;
+  marksButton.disabled = requestPending || !selected || !hasTab;
+  marksButton.textContent = `Marks (${marks.length})`;
+  marksButton.setAttribute('aria-expanded', String(marksOpen));
+  marksButton.title = marksOpen ? 'Hide the marked elements' : 'Show the marked elements on this tab';
+  root.classList.toggle('marks-open', marksOpen);
+  marksPanel.hidden = !marksOpen;
+  if (!marksOpen) return;
+  const signature = JSON.stringify(marks.map((mark) => [
+    mark.id,
+    mark.resolved,
+    mark.selector,
+    mark.shadowHostSelector,
+    Array.isArray(mark.shadowPath) ? mark.shadowPath.join('>') : '',
+    Array.isArray(mark.frameSelectors) ? mark.frameSelectors.join('>') : '',
+    mark.tag,
+    mark.name,
+  ]));
+  if (signature === marksSignature) return;
+  marksSignature = signature;
+  const rows = marks.map((mark) => {
+    const row = document.createElement('li');
+    row.className = 'marks-row';
+    const status = document.createElement('span');
+    status.className = 'marks-status';
+    status.dataset.state = mark.resolved === true ? 'found' : mark.resolved === false ? 'missing' : 'unknown';
+    status.title = mark.resolved === true ? 'Element found' : mark.resolved === false ? 'Element is no longer on the page' : 'Element state is unknown';
+    const main = document.createElement('div');
+    main.className = 'marks-main';
+    const title = document.createElement('span');
+    title.className = 'marks-title';
+    title.textContent = mark.name ? `${mark.tag} · ${mark.name}` : mark.tag;
+    const selector = document.createElement('code');
+    selector.className = 'marks-selector';
+    selector.textContent = markPath(mark) || '(no selector)';
+    selector.title = selector.textContent;
+    main.append(title, selector);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'marks-delete';
+    remove.title = 'Remove this mark';
+    remove.setAttribute('aria-label', `Remove ${markPath(mark) || mark.tag}`);
+    setIcon(remove, (svg) => {
+      addLine(svg, { x1: '7', y1: '7', x2: '17', y2: '17' });
+      addLine(svg, { x1: '17', y1: '7', x2: '7', y2: '17' });
+    });
+    remove.addEventListener('click', () => {
+      void request('/browser/mark/delete', { id: mark.id, generation: state?.generation });
+    });
+    row.append(status, main, remove);
+    return row;
+  });
+  if (rows.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'marks-empty';
+    empty.textContent = 'No marked elements on this tab.';
+    rows.push(empty);
+  }
+  marksList.replaceChildren(...rows);
+  copyHint.disabled = marks.length === 0;
+  clearMarks.disabled = marks.length === 0;
+};
+
+markButton.addEventListener('click', () => {
+  if (!state || requestPending) return;
+  const mark = state.mark ?? {};
+  if (mark.active) {
+    void request('/browser/mark/cancel', { generation: state.generation, session: mark.session });
+    return;
+  }
+  const session = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  void request('/browser/mark/start', { generation: state.generation, session });
+});
+
+marksButton.addEventListener('click', () => {
+  if (!state) return;
+  marksOpen = !marksOpen;
+  if (marksOpen && consoleOpen) {
+    consoleOpen = false;
+    consolePanel.hidden = true;
+    root.classList.remove('console-open');
+  }
+  void host.setHeight(marksOpen ? DOCK_HEIGHT + MARKS_HEIGHT : DOCK_HEIGHT).catch(() => {});
+  render();
+  if (marksOpen) void request('/browser/mark/resolve', {});
+});
+
+copyHint.addEventListener('click', () => {
+  const marks = state?.mark?.marks ?? [];
+  if (marks.length === 0) return;
+  void host.writeClipboard(markHint(marks)).catch(() => {});
+});
+
+clearMarks.addEventListener('click', () => {
+  if (!state) return;
+  void request('/browser/mark/clear', { generation: state.generation });
+});
+
 let consoleSignature = '';
 const renderConsole = () => {
   root.classList.toggle('console-open', consoleOpen);
@@ -356,8 +528,8 @@ pageTabsRow.append(pageTabs, newTab);
 
 const navigationRow = document.createElement('div');
 navigationRow.className = 'row navigation-row';
-navigationRow.append(back, forward, reload, address, customSize, problems, viewportSelect, rotate, mobileToggle, selectCompatibility);
-root.append(scopeRow, pageTabsRow, navigationRow, consolePanel);
+navigationRow.append(back, forward, reload, address, customSize, problems, markButton, marksButton, viewportSelect, rotate, mobileToggle, selectCompatibility);
+root.append(scopeRow, pageTabsRow, navigationRow, consolePanel, marksPanel);
 
 let state = null;
 let requestPending = false;
@@ -414,6 +586,8 @@ const render = () => {
   const scopes = state?.scopes ?? [];
   const selected = scopes.find((scope) => scope.id === state?.selectedScopeId) ?? null;
   const usable = dockUsable();
+  const markState = state?.mark ?? {};
+  const marks = markState.marks ?? [];
   scopeSelect.disabled = requestPending || scopes.length < 2 || !usable;
   const chat = currentChat();
   chatButton.hidden = !chat || Boolean(scopeForChat(chat));
@@ -456,6 +630,17 @@ const render = () => {
   selectCompatibility.title = compatibilityLabel;
   selectCompatibility.setAttribute('aria-label', compatibilityLabel);
 
+  const markUsable = state?.controller === 'user'
+    && state?.viewerInControl === true
+    && selected?.tabs?.some((tab) => tab.active) === true;
+  markButton.disabled = requestPending || !markUsable;
+  markButton.setAttribute('aria-pressed', String(markState.active === true));
+  markButton.title = markState.active
+    ? 'Cancel marking'
+    : markUsable
+      ? 'Mark an element on the page'
+      : 'Take control of the page first: click or type in it, then use the crosshair.';
+
   const { errors = 0, warnings = 0 } = selected?.problems ?? {};
   // An open console keeps its toggle even once the page has no problems.
   problems.hidden = errors + warnings === 0 && !consoleOpen;
@@ -466,6 +651,7 @@ const render = () => {
   problems.title = problemsLabel;
   problems.setAttribute('aria-label', problemsLabel);
   renderConsole();
+  renderMarks(selected);
 
   const viewport = selected?.viewport ?? null;
   const choice = viewportChoice(viewport);
@@ -483,9 +669,9 @@ const render = () => {
   let statusMessage = '';
   let statusTitle = 'Click or type in the page to take control. Enter an address and press Enter to navigate.';
   const notice = state?.notice ? `${scopeLabel(state.notice)}: ${state.notice.message}` : null;
-  if (commandError || serviceError || notice || selected?.nativeSelectCompatibilityError) {
+  if (commandError || serviceError || notice || selected?.nativeSelectCompatibilityError || markState.error) {
     statusState = 'error';
-    statusMessage = commandError ?? serviceError ?? notice ?? selected.nativeSelectCompatibilityError;
+    statusMessage = commandError ?? serviceError ?? notice ?? selected?.nativeSelectCompatibilityError ?? markState.error;
     statusTitle = statusMessage;
   } else if (!selected) {
     statusState = 'waiting';
@@ -493,6 +679,18 @@ const render = () => {
       ? 'Open this chat\'s browser or ask the agent to use openchamber_web'
       : 'Ask the agent to open a page with openchamber_web';
     statusTitle = 'The browser starts with the agent\'s first browser action in a chat, or when you open it for the chat you are viewing.';
+  } else if (markState.active && !markState.ready) {
+    statusState = 'user';
+    statusMessage = 'Preparing the marker…';
+    statusTitle = 'The marker is being installed on the page.';
+  } else if (markState.active && markState.ready) {
+    statusState = 'user';
+    statusMessage = 'Move over the page, click to mark an element, right-click or Esc to cancel.';
+    statusTitle = 'The page stays under your control until you hand it back.';
+  } else if (state.controller === 'user' && marks.length > 0) {
+    statusState = 'user';
+    statusMessage = `${marks.length} marked element${marks.length === 1 ? '' : 's'}. Hand control back to the agent so it can read them.`;
+    statusTitle = 'The agent cannot read the marks while you hold control.';
   } else if (state.controller === 'user') {
     statusState = 'user';
     statusTitle = state.viewerInControl
@@ -588,6 +786,7 @@ const refresh = async () => {
 };
 
 problems.addEventListener('click', () => {
+  if (marksOpen) marksOpen = false;
   consoleOpen = !consoleOpen;
   consoleEntries = null;
   void host.setHeight(consoleOpen ? DOCK_HEIGHT + CONSOLE_HEIGHT : DOCK_HEIGHT).catch(() => {});

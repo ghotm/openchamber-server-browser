@@ -229,6 +229,7 @@ export const createSurface = (runtime) => {
       const current = await start();
       const menu = runtime.contextMenu;
       for (const event of events) {
+        if (await runtime.handleMarkInput?.(event, current)) continue;
         if (event.type === 'key' && event.key === 'Escape' && event.action === 'up' && swallowEscapeUp) {
           swallowEscapeUp = false;
           continue;
@@ -253,6 +254,7 @@ export const createSurface = (runtime) => {
       // The manager repeats the viewer's claim with every input batch; only a
       // change of hands closes the menu.
       if (runtime.controller !== controller) void runtime.contextMenu.close();
+      if (controller !== 'user') void runtime.cancelMark?.();
       runtime.controller = controller;
     },
     resize({ width, height }) {

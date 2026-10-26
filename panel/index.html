@@ -11,6 +11,7 @@
       button, input, select { font: inherit; }
       #root { display: grid; grid-template-rows: 28px 28px 40px; padding: 4px 8px; background: var(--oc-bg, transparent); color: var(--oc-fg, inherit); }
       #root.console-open { grid-template-rows: 28px 28px 40px minmax(0, 1fr); }
+      #root.marks-open { grid-template-rows: 28px 28px 40px minmax(0, 1fr); }
       .row { display: flex; align-items: center; min-width: 0; }
       .scope-row { gap: 8px; border-bottom: 1px solid var(--oc-subtle, var(--oc-border, currentColor)); }
       .session-tabs { flex: 1; min-width: 0; margin: 0; padding: 0; border: 0; }
@@ -74,6 +75,28 @@
       .console-row[data-level="warning"] .console-level { color: var(--oc-warning-text, var(--oc-warning, currentColor)); }
       .console-message { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .console-source { flex: 0 1 auto; max-width: 30%; overflow: hidden; color: var(--oc-muted, currentColor); text-overflow: ellipsis; white-space: nowrap; }
+      .navigation-row .mark-button[aria-pressed="true"] { background: var(--oc-selection, var(--oc-hover, transparent)); color: var(--oc-selection-fg, var(--oc-fg, inherit)); }
+      .navigation-row .marks-button { display: inline-flex; width: auto; flex: 0 0 auto; height: 22px; align-items: center; margin-left: 4px; padding: 0 8px; border-radius: 999px; background: var(--oc-hover, transparent); color: inherit; font-size: 11px; white-space: nowrap; }
+      .navigation-row .marks-button[aria-expanded="true"] { background: var(--oc-selection, var(--oc-hover, transparent)); }
+      .navigation-row .marks-button[hidden] { display: none; }
+      .marks { display: flex; min-height: 0; flex-direction: column; border-top: 1px solid var(--oc-subtle, var(--oc-border, currentColor)); }
+      .marks[hidden] { display: none; }
+      .marks-header { margin: 0; padding: 4px 4px 2px; overflow: hidden; color: var(--oc-muted, currentColor); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+      .marks-list { flex: 1; min-height: 0; margin: 0; padding: 0; overflow: auto; list-style: none; }
+      .marks-row { display: grid; grid-template-columns: 10px minmax(0, 1fr) 24px; align-items: center; gap: 8px; padding: 3px 4px; border-bottom: 1px solid var(--oc-subtle, transparent); }
+      .marks-status { width: 7px; height: 7px; border-radius: 50%; background: var(--oc-muted, currentColor); opacity: .65; }
+      .marks-status[data-state="found"] { background: var(--oc-success, var(--oc-muted, currentColor)); }
+      .marks-status[data-state="missing"] { background: var(--oc-error, currentColor); }
+      .marks-main { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+      .marks-title { overflow: hidden; color: var(--oc-fg, inherit); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+      .marks-selector { overflow: hidden; color: var(--oc-muted, currentColor); font: 10px/16px var(--oc-mono, ui-monospace, monospace); text-overflow: ellipsis; white-space: nowrap; }
+      .marks-delete { display: inline-flex; width: 24px; height: 24px; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: var(--oc-radius, 6px); background: transparent; color: var(--oc-muted, currentColor); cursor: pointer; }
+      .marks-delete:hover:not(:disabled) { background: var(--oc-hover, transparent); color: var(--oc-fg, inherit); }
+      .marks-delete svg { width: 12px; height: 12px; pointer-events: none; }
+      .marks-footer { display: flex; gap: 6px; padding: 4px; border-top: 1px solid var(--oc-subtle, var(--oc-border, currentColor)); }
+      .marks-action { height: 22px; padding: 0 8px; border: 1px solid var(--oc-border, currentColor); border-radius: 999px; background: transparent; color: inherit; font-size: 11px; cursor: pointer; }
+      .marks-action:hover:not(:disabled) { background: var(--oc-hover, transparent); }
+      .marks-empty { padding: 6px 4px; color: var(--oc-muted, currentColor); font-size: 11px; }
       input:focus, button:focus-visible, select:focus-visible { outline: 2px solid var(--oc-focus, currentColor); outline-offset: 1px; }
       .console-list:focus-visible { outline: 2px solid var(--oc-focus, currentColor); outline-offset: -2px; }
       @media (forced-colors: active) {

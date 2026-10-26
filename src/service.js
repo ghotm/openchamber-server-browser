@@ -258,6 +258,31 @@ export const createService = ({ runtime, token, port = 0 }) => {
       }
     }
 
+    const markOperation = request.method === 'POST' ? /^\/browser\/mark\/(start|cancel|delete|clear|resolve)$/.exec(url.pathname)?.[1] : null;
+    if (markOperation) {
+      const body = await readObjectBody(request);
+      const generation = generationProperty(body);
+      const session = stringProperty(body, 'session');
+      const id = stringProperty(body, 'id');
+      if (markOperation !== 'resolve' && generation === null) {
+        return text(response, 400, 'generation is required\n');
+      }
+      if ((markOperation === 'start' || markOperation === 'cancel') && !session) {
+        return text(response, 400, 'session is required\n');
+      }
+      if (markOperation === 'delete' && !id) return text(response, 400, 'id is required\n');
+      try {
+        if (markOperation === 'start') await runtime.startMark(session, generation, access);
+        else if (markOperation === 'cancel') await runtime.cancelMark(session, generation, access);
+        else if (markOperation === 'delete') await runtime.deleteMark(id, generation, access);
+        else if (markOperation === 'clear') await runtime.clearMarks(generation, access);
+        else await runtime.resolveMarks();
+        return json(response, 200, runtime.state(access));
+      } catch (error) {
+        return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
+      }
+    }
+
     if (request.method === 'POST' && url.pathname === '/browser/navigate') {
       const body = await readObjectBody(request);
       const target = stringProperty(body, 'url');

@@ -5,6 +5,17 @@ import { connectCdp } from './cdp-client.js';
 import { createChromeProcess } from './chrome-process.js';
 import { MENU_BINDING, MENU_WORLD, createContextMenu } from './context-menu.js';
 import { createInspector } from './inspector.js';
+import { createMarkCdp } from './mark-cdp.js';
+import {
+  MARK_LIMIT,
+  MARK_WORLD,
+  cancelMark as cancelMarkOverlay,
+  clearMarkHighlight,
+  installMark,
+  resolveMarkItems,
+  sanitizeMarkPayload,
+  setMarkHighlight,
+} from './mark.js';
 import { networkGrants, originGrants } from './config.js';
 import { createNativeSelectCompatibility } from './native-select-compatibility.js';
 import { createPolicyProxy } from './policy-proxy.js';
@@ -30,6 +41,18 @@ const createTab = (targetId, sessionId, openerId) => ({
   problems: [],
   compatibility: null,
   lastActive: 0,
+  marks: [],
+  markActive: false,
+  markReady: false,
+  markSession: null,
+  markError: null,
+  markContextId: null,
+  markFrameContexts: [],
+  markCdp: null,
+  markHoverAt: 0,
+  markHoverBusy: false,
+  markSwallowPointerUp: false,
+  markSwallowKeyUp: false,
 });
 
 const isScopePage = (info, contextId) => info?.type === 'page'
@@ -97,6 +120,22 @@ export const createBrowserRuntime = ({
     },
     controller: 'none',
     agentActive: false,
+    get markState() {
+      const current = activeTab();
+      return {
+        active: current?.markActive === true,
+        ready: current?.markReady === true,
+        session: current?.markSession ?? null,
+        error: current?.markError ?? null,
+        marks: (current?.marks ?? []).map((mark) => ({
+          ...mark,
+          attributes: { ...mark.attributes },
+          shadowPath: Array.isArray(mark.shadowPath) ? [...mark.shadowPath] : [],
+          frameSelectors: Array.isArray(mark.frameSelectors) ? [...mark.frameSelectors] : [],
+          rect: mark.rect ? { ...mark.rect } : null,
+        })),
+      };
+    },
     get url() {
       return activeTab()?.url ?? 'about:blank';
     },
@@ -154,7 +193,101 @@ export const createBrowserRuntime = ({
     if (current.problems.length > 50) current.problems.shift();
   };
 
-  const pageOf = (current) => ({ cdp, contextId, targetId: current.targetId, sessionId: current.sessionId });
+  const pageOf = (current) => ({ cdp, contextId, targetId: current.targetId, sessionId: current.sessionId, mainFrameId: current.mainFrameId });
+
+  const resetMarkState = (current) => {
+    if (!current) return;
+    current.markActive = false;
+    current.markReady = false;
+    current.markSession = null;
+    current.markError = null;
+    current.markContextId = null;
+    current.markFrameContexts = [];
+    current.markCdp?.close?.();
+    current.markCdp = null;
+    current.markHoverAt = 0;
+    current.markHoverBusy = false;
+    current.markSwallowPointerUp = false;
+    current.markSwallowKeyUp = false;
+  };
+
+  const cancelMarkContexts = async (current, contexts) => {
+    if (!current || contexts.length === 0) return;
+    await Promise.allSettled(contexts.map(({ contextId }) => (
+      cancelMarkOverlay(pageOf(current), contextId)
+    )));
+  };
+
+  const cancelMarkMode = async () => {
+    const current = activeTab();
+    if (!current) return;
+    const contexts = current.markFrameContexts.length > 0
+      ? current.markFrameContexts.slice()
+      : current.markContextId === null
+        ? []
+        : [{ frameId: current.mainFrameId, contextId: current.markContextId }];
+    resetMarkState(current);
+    await cancelMarkContexts(current, contexts);
+  };
+
+  const addMark = (current, payload) => {
+    const mark = sanitizeMarkPayload(payload, {
+      tabId: current.targetId,
+      url: current.url,
+      title: current.title,
+    });
+    if (!mark) return false;
+    current.marks.push(mark);
+    if (current.marks.length > MARK_LIMIT) current.marks.splice(0, current.marks.length - MARK_LIMIT);
+    return true;
+  };
+
+  const resolveMarksFor = async (current) => {
+    if (!current || current.marks.length === 0) return [];
+    const resolver = createMarkCdp({
+      cdp,
+      sessionId: current.sessionId,
+      frameId: current.mainFrameId,
+      url: current.url,
+      title: current.title,
+    });
+    let results;
+    let failed = false;
+    try {
+      results = await resolver.resolve(resolveMarkItems(current.marks));
+    } catch {
+      results = [];
+      failed = true;
+    } finally {
+      await resolver.close();
+    }
+    const byId = new Map(results.map((result) => [result.id, result]));
+    for (const mark of current.marks) {
+      const result = byId.get(mark.id);
+      if (failed) mark.resolved = null;
+      else if (result) mark.resolved = result.status === 'error' ? null : result.status === 'found';
+      else mark.resolved = false;
+      if (result?.rect) {
+        const { x, y, width, height } = result.rect;
+        if ([x, y, width, height].every(Number.isFinite)) {
+          mark.rect = {
+            x: Math.round(x),
+            y: Math.round(y),
+            width: Math.max(0, Math.round(width)),
+            height: Math.max(0, Math.round(height)),
+          };
+        }
+      }
+    }
+    return current.marks.map((mark) => ({
+      ...mark,
+      attributes: { ...mark.attributes },
+      shadowPath: Array.isArray(mark.shadowPath) ? [...mark.shadowPath] : [],
+      frameSelectors: Array.isArray(mark.frameSelectors) ? [...mark.frameSelectors] : [],
+      rect: mark.rect ? { ...mark.rect } : null,
+    }));
+  };
+
 
   const notifyTabs = () => {
     for (const listener of tabListeners) listener();
@@ -198,6 +331,7 @@ export const createBrowserRuntime = ({
   const activate = async (current) => {
     if (activeTargetId === current.targetId || tabs.get(current.targetId) !== current) return;
     const previous = activeTab();
+    if (previous?.markActive) await cancelMarkMode();
     if (previous) inspector.endTab(previous.sessionId);
     activeTargetId = current.targetId;
     activations += 1;
@@ -292,17 +426,21 @@ export const createBrowserRuntime = ({
     if (!current) return;
     inspector.event(current.sessionId, event.method, event.params);
     if (event.method === 'Page.frameNavigated' && event.params.frame?.id) {
-      if (!event.params.frame.parentId) {
-        current.mainFrameId = event.params.frame.id;
+      const frame = event.params.frame;
+      if (!frame.parentId) {
+        current.mainFrameId = frame.id;
         // A new document starts with no problems, like the DevTools console.
+        current.marks = [];
+        resetMarkState(current);
         current.problems.length = 0;
         contextMenu.forget(current.sessionId);
-        current.url = event.params.frame.url;
+        current.url = frame.url;
         void refreshNavigation(current);
       }
-      current.compatibility.frameNavigated(event.params.frame.id);
+      current.compatibility.frameNavigated(frame.id);
     }
     if (event.method === 'Page.frameDetached' && event.params.frameId) {
+      current.markFrameContexts = current.markFrameContexts.filter((entry) => entry.frameId !== event.params.frameId);
       current.compatibility.frameDetached(event.params.frameId);
     }
     if (event.method === 'Page.navigatedWithinDocument' && event.params.frameId === current.mainFrameId) {
@@ -436,6 +574,144 @@ export const createBrowserRuntime = ({
     return { closed: true, tabId: current.targetId };
   };
 
+  const createMarkContext = async (current, frameId) => {
+    const world = await cdp.sendSession(current.sessionId, 'Page.createIsolatedWorld', {
+      frameId,
+      worldName: MARK_WORLD,
+    });
+    const contextId = world.executionContextId;
+    if (!Number.isInteger(contextId)) throw new Error('Chrome returned no isolated world for marking');
+    await installMark(pageOf(current), contextId);
+    return { frameId, contextId };
+  };
+
+  runtime.startMark = async (session) => {
+    await runtime.ensurePage();
+    const current = activeTab();
+    if (!current) throw new Error('This chat has no browser tab to mark');
+    if (current.markActive) await cancelMarkMode();
+    current.markError = null;
+    const resolver = createMarkCdp({
+      cdp,
+      sessionId: current.sessionId,
+      frameId: current.mainFrameId,
+      url: current.url,
+      title: current.title,
+    });
+    try {
+      const mainContext = await createMarkContext(current, current.mainFrameId);
+      current.markCdp = resolver;
+      current.markContextId = mainContext.contextId;
+      current.markFrameContexts = [mainContext];
+      current.markActive = true;
+      current.markReady = true;
+      current.markSession = typeof session === 'string' ? session : null;
+    } catch (error) {
+      await resolver.close();
+      resetMarkState(current);
+      current.markError = error instanceof Error ? error.message : 'Could not start marking';
+      throw error;
+    }
+  };
+
+  runtime.cancelMark = cancelMarkMode;
+
+  runtime.deleteMark = (id) => {
+    const current = activeTab();
+    if (!current || typeof id !== 'string') return;
+    current.marks = current.marks.filter((mark) => mark.id !== id);
+  };
+
+  runtime.clearMarks = async () => {
+    const current = activeTab();
+    if (!current) return;
+    if (current.markActive) await cancelMarkMode();
+    current.marks = [];
+  };
+
+  runtime.resolveMarks = async () => {
+    const current = activeTab();
+    if (!current) return [];
+    return resolveMarksFor(current);
+  };
+
+  runtime.snapshotMarks = async (page) => {
+    const current = tabs.get(page.targetId);
+    if (!current) return [];
+    return resolveMarksFor(current);
+  };
+
+  runtime.markHover = async (current, point) => {
+    const resolver = current?.markCdp;
+    if (!resolver || current.markHoverBusy) return;
+    const now = Date.now();
+    if (now - current.markHoverAt < 40) return;
+    current.markHoverAt = now;
+    current.markHoverBusy = true;
+    try {
+      const highlight = await resolver.hoverAt(point);
+      if (!current.markActive || current.markCdp !== resolver || current.markContextId === null) return;
+      if (highlight) {
+        await setMarkHighlight(pageOf(current), current.markContextId, highlight);
+      } else {
+        await clearMarkHighlight(pageOf(current), current.markContextId);
+      }
+    } catch {
+      // A stale hit or a frame that went away only loses this hover frame.
+    } finally {
+      current.markHoverBusy = false;
+    }
+  };
+
+  runtime.handleMarkInput = async (event, page) => {
+    const current = activeTab();
+    if (!current) return false;
+    if (event.type === 'pointer' && event.action === 'up' && current.markSwallowPointerUp) {
+      current.markSwallowPointerUp = false;
+      return true;
+    }
+    if (event.type === 'key' && event.action === 'up' && current.markSwallowKeyUp) {
+      current.markSwallowKeyUp = false;
+      return true;
+    }
+    if (!current.markActive) return false;
+    if (event.type === 'pointer') {
+      if (event.action === 'down' && event.button === 0) {
+        const contexts = current.markFrameContexts.slice();
+        const resolver = current.markCdp;
+        let payload = null;
+        if (resolver) {
+          payload = await resolver.describeAt({ x: event.x, y: event.y }).catch(() => null);
+        }
+        resetMarkState(current);
+        current.markSwallowPointerUp = true;
+        if (payload) addMark(current, payload);
+        void cancelMarkContexts(current, contexts);
+        return true;
+      }
+      if (event.action === 'down' && event.button === 2) {
+        await cancelMarkMode();
+        current.markSwallowPointerUp = true;
+        return true;
+      }
+      if (event.action === 'move') {
+        void runtime.markHover(current, { x: event.x, y: event.y });
+        return false;
+      }
+      return true;
+    }
+    if (event.type === 'key') {
+      if (event.key === 'Escape') {
+        await cancelMarkMode();
+        current.markSwallowKeyUp = true;
+        return true;
+      }
+      return true;
+    }
+    if (event.type === 'wheel') return false;
+    return true;
+  };
+
   // The active tab decides; other tabs follow on a best-effort basis.
   runtime.setNativeSelectCompatibility = async (enabled) => {
     await runtime.ensurePage();
@@ -488,6 +764,7 @@ export const createBrowserRuntime = ({
   runtime.command = async (name, parameters = {}) => {
     if (closed) throw new Error('Browser runtime is closed');
     await contextMenu.close();
+    await cancelMarkMode();
     if (name === 'tab-new') {
       await openTab();
       return;
@@ -570,6 +847,9 @@ export const createBrowserRuntime = ({
       signal.throwIfAborted();
       if (runtime.controller === 'user') {
         throw new Error('The user controls the browser. Wait for them to hand control back.');
+      }
+      if (activeTab()?.markActive) {
+        throw new Error('The user is marking an element. Wait for them to finish.');
       }
       await contextMenu.close();
       runtime.agentActive = true;

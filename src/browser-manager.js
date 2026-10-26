@@ -180,6 +180,12 @@ export const createBrowserManager = ({
     if (shownEarlierView(frameSeq)) throw new Error('The browser view changed before the dock command ran');
   };
 
+  const requireUserControl = ({ viewer = null } = {}) => {
+    if (controller !== 'user' || viewer === null || viewer !== controllingViewer) {
+      throw new Error('Take control of the page before marking elements');
+    }
+  };
+
   const requireGeneration = (expectedGeneration) => {
     if (expectedGeneration !== viewGeneration) {
       throw new Error('The browser view changed before the dock command ran');
@@ -237,6 +243,7 @@ export const createBrowserManager = ({
         generation: viewGeneration,
         notice: notice ? { ...notice } : null,
         copy: selected()?.runtime.copyRequest ?? null,
+        mark: selected()?.runtime.markState ?? { active: false, ready: false, session: null, error: null, marks: [] },
         // The visible tab's errors and warnings, only for a dock whose console is open.
         ...(problems ? { consoleProblems: selected()?.runtime.consoleProblems?.() ?? [] } : {}),
         scopes: Array.from(scopes.values(), (entry) => ({
@@ -310,6 +317,51 @@ export const createBrowserManager = ({
     },
     closeTab(tabId, expectedGeneration, access) {
       return dockCommand('tab-close', { tabId }, expectedGeneration, access);
+    },
+    startMark(session, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        requireUserControl(access);
+        const entry = requireSelected();
+        touch(entry);
+        await entry.runtime.startMark(session);
+      });
+    },
+    cancelMark(session, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        if (session && entry.runtime.markState.session !== session) return;
+        touch(entry);
+        await entry.runtime.cancelMark();
+      });
+    },
+    deleteMark(id, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        touch(entry);
+        entry.runtime.deleteMark(id);
+      });
+    },
+    clearMarks(expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        touch(entry);
+        await entry.runtime.clearMarks();
+      });
+    },
+    resolveMarks() {
+      return enqueue(async () => {
+        const entry = requireSelected();
+        touch(entry);
+        return entry.runtime.resolveMarks();
+      });
     },
     setViewport({ mode, width, height, mobile }, expectedGeneration, access) {
       return enqueue(async () => {

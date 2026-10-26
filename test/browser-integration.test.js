@@ -33,7 +33,7 @@ body { margin: 0; font-family: sans-serif; min-height: 2400px; }
 #hash { position: absolute; left: 10px; top: 230px; }
 </style></head><body>${body}</body></html>`;
 
-const startWebFixture = async () => {
+const startWebFixture = async ({ frameOrigin = '' } = {}) => {
   const server = http.createServer((request, response) => {
     response.setHeader('content-type', 'text/html; charset=utf-8');
     if (request.url === '/selects') {
@@ -130,6 +130,31 @@ const startWebFixture = async () => {
           document.querySelector('#host').attachShadow({ mode: 'open' }).innerHTML = '<input id="shadowed" value="shadow text">';
         </script>
       `, 'Copy'));
+      return;
+    }
+    if (request.url === '/shadow') {
+      response.end(html(`
+        <div id="closed-host" style="position:absolute;left:20px;top:20px;width:200px;height:60px"></div>
+        <div id="outer-host" style="position:absolute;left:20px;top:120px;width:220px;height:70px"></div>
+        <script>
+          const closed = document.querySelector('#closed-host').attachShadow({ mode: 'closed' });
+          closed.innerHTML = '<button id="closed-btn" style="position:absolute;left:10px;top:10px;width:120px;height:40px">Closed</button>';
+          const outer = document.querySelector('#outer-host').attachShadow({ mode: 'open' });
+          outer.innerHTML = '<div id="inner-host" style="position:absolute;left:10px;top:10px;width:180px;height:50px"></div>';
+          const inner = outer.querySelector('#inner-host').attachShadow({ mode: 'open' });
+          inner.innerHTML = '<button id="nested-btn" style="position:absolute;left:10px;top:10px;width:140px;height:30px">Nested</button>';
+        </script>
+      `, 'Shadow'));
+      return;
+    }
+    if (request.url === '/cross') {
+      response.end(html(`
+        <iframe id="cross" src="${frameOrigin}/cross-inner" style="position:absolute;left:10px;top:10px;width:300px;height:120px;border:0"></iframe>
+      `, 'Cross'));
+      return;
+    }
+    if (request.url === '/cross-inner') {
+      response.end(html('<button id="cross-btn" style="position:absolute;left:20px;top:20px;width:120px;height:40px">Cross</button>', 'Cross inner'));
       return;
     }
     if (request.url === '/keys') {
@@ -751,6 +776,47 @@ test('selects a native option by exact label or value', { skip: chromePath ? fal
   await assert.rejects(runtime.perform('browser.select', { selector: '#native', label: 'One', value: 'One' }), /exactly one of label or value/);
 });
 
+test('marks an element inside a same-origin iframe and keeps the frame chain', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page with a same-origin frame and an armed marker.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/copy` });
+  const page = await runtime.ensurePage();
+  await runtime.startMark('frame-test');
+
+  // When the marker confirms over the textarea inside the frame.
+  const point = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression: `(() => {
+      const frame = document.querySelector('#frame');
+      const outer = frame.getBoundingClientRect();
+      const inner = frame.contentDocument.querySelector('#inner').getBoundingClientRect();
+      return JSON.stringify({
+        x: outer.left + frame.clientLeft + inner.left + inner.width / 2,
+        y: outer.top + frame.clientTop + inner.top + inner.height / 2,
+      });
+    })()`,
+    returnByValue: true,
+  });
+  assert.equal(await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 0, ...JSON.parse(point.result.value) }, page), true);
+
+  // Then the mark keeps the frame chain and snapshot resolves it.
+  assert.equal(runtime.markState.marks.length, 1);
+  assert.deepEqual(runtime.markState.marks[0].frameSelectors, ['#frame']);
+  assert.equal(runtime.markState.marks[0].tag, 'textarea');
+  const snapshot = await runtime.perform('browser.snapshot', {});
+  assert.equal(snapshot.marks.length, 1);
+  assert.deepEqual(snapshot.marks[0].frameSelectors, ['#frame']);
+  assert.equal(snapshot.marks[0].resolved, true);
+
+  // And cancelling the next marker leaves the confirmed list alone.
+  await runtime.startMark('frame-test-2');
+  await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 2, x: 5, y: 5 }, page);
+  assert.equal(runtime.markState.active, false);
+  assert.equal(runtime.markState.marks.length, 1);
+});
+
 test('closes this chat\'s tabs without creating one', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
   // Given a chat with no browser tab.
   const web = await startWebFixture();
@@ -778,4 +844,85 @@ test('closes this chat\'s tabs without creating one', { skip: chromePath ? false
   await assert.rejects(runtime.perform('browser.close', {}), /no browser tab to close/);
   const reopened = await runtime.perform('browser.open', { url: `${web.origin}/title` });
   assert.equal(reopened.title, 'Title before');
+});
+
+test('marks elements inside closed and nested shadow roots', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page with a closed shadow root and two nested open shadow roots.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/shadow` });
+  const page = await runtime.ensurePage();
+
+  // When the marker confirms over the button inside the closed root.
+  await runtime.startMark('closed-shadow');
+  assert.equal(await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 0, x: 90, y: 50 }, page), true);
+
+  // Then the closed path is kept and snapshot still finds the button.
+  assert.equal(runtime.markState.marks.length, 1);
+  const closedMark = runtime.markState.marks[0];
+  assert.equal(closedMark.tag, 'button');
+  assert.ok(closedMark.shadowPath.length >= 2);
+  assert.ok(closedMark.shadowPath.some((part) => part.includes('closed-btn')));
+  assert.match(closedMark.name, /Closed/);
+
+  // When the marker confirms over the button inside both nested roots.
+  await runtime.startMark('nested-shadow');
+  assert.equal(await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 0, x: 110, y: 155 }, page), true);
+
+  // Then the full nested path is kept and both marks resolve.
+  assert.equal(runtime.markState.marks.length, 2);
+  const nestedMark = runtime.markState.marks[1];
+  assert.equal(nestedMark.tag, 'button');
+  assert.ok(nestedMark.shadowPath.length >= 3);
+  assert.ok(nestedMark.shadowPath.some((part) => part.includes('nested-btn')));
+  assert.match(nestedMark.name, /Nested/);
+  const snapshot = await runtime.perform('browser.snapshot', {});
+  assert.deepEqual(snapshot.marks.map((mark) => mark.resolved), [true, true]);
+});
+
+test('marks an element inside a cross-origin iframe', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page whose iframe comes from another origin.
+  const frame = await startWebFixture();
+  context.after(() => close(frame.server));
+  const web = await startWebFixture({ frameOrigin: frame.origin });
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin, frame.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/cross` });
+  const page = await runtime.ensurePage();
+  await waitFor(async () => {
+    const result = await page.cdp.sendSession(page.sessionId, 'Page.getFrameTree', {});
+    return (result.frameTree?.childFrames?.length ?? 0) > 0;
+  });
+  const tree = await page.cdp.sendSession(page.sessionId, 'Page.getFrameTree', {});
+  const childFrameId = tree.frameTree.childFrames[0].frame.id;
+  const probe = await page.cdp.sendSession(page.sessionId, 'Page.createIsolatedWorld', {
+    frameId: childFrameId,
+    worldName: 'openchamber-test-probe',
+  });
+  await waitFor(async () => {
+    const found = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+      contextId: probe.executionContextId,
+      expression: "Boolean(document.querySelector('#cross-btn'))",
+      returnByValue: true,
+    });
+    return found?.result?.value === true;
+  });
+
+  // When the marker confirms over the button inside the cross-origin frame.
+  await runtime.startMark('cross-frame');
+  assert.equal(await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 0, x: 90, y: 50 }, page), true);
+
+  // Then the frame chain is kept and snapshot resolves the inner button.
+  assert.equal(runtime.markState.marks.length, 1);
+  const mark = runtime.markState.marks[0];
+  assert.equal(mark.tag, 'button');
+  assert.deepEqual(mark.frameSelectors, ['#cross']);
+  assert.match(mark.name, /Cross/);
+  const snapshot = await runtime.perform('browser.snapshot', {});
+  assert.equal(snapshot.marks.length, 1);
+  assert.deepEqual(snapshot.marks[0].frameSelectors, ['#cross']);
+  assert.equal(snapshot.marks[0].resolved, true);
 });

@@ -129,8 +129,10 @@ export const createBrowserActions = (runtime) => async (action, parameters, sign
   if (action === 'browser.snapshot') {
     const data = await runPageScript(page, buildSnapshotScript(parameters), signal);
     const problems = runtime.consoleProblems(page.targetId);
+    const marks = await runtime.snapshotMarks(page);
     return {
       ...data,
+      ...(marks.length > 0 ? { marks } : {}),
       viewport: viewportSummary(runtime.viewport),
       ...(problems.length > 0 ? { consoleProblems: problems } : {}),
       tabs: runtime.tabs.map(({ id, title, url, active }) => ({ id, title, url, active })),
