@@ -29,7 +29,7 @@ export const startService = async ({
   // One scanner serves every scope; it caches the listener table briefly.
   const devServers = config.discoverDevServers ? createDevServerScanner() : null;
   const browserRuntime = runtime ?? createBrowserManager({
-    createRuntime: () => createBrowserRuntime({ ...config, devServers }),
+    createRuntime: (context) => createBrowserRuntime({ ...config, devServers, scope: context }),
   });
   const service = createService({
     runtime: browserRuntime,

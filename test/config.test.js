@@ -5,8 +5,23 @@ import { networkGrants, originGrants, parseConfig } from '../src/config.js';
 test('defaults to no private origin grants', () => {
   const config = parseConfig({});
 
-  assert.deepEqual(config, { chromePath: null, allowedOrigins: [], allowedNetworks: [], discoverDevServers: false });
+  assert.deepEqual(config, {
+    chromePath: null,
+    profileRoot: null,
+    allowedOrigins: [],
+    allowedNetworks: [],
+    discoverDevServers: false,
+  });
   assert.deepEqual(originGrants(config.allowedOrigins), []);
+});
+
+test('accepts only an absolute persistent profile root', () => {
+  assert.equal(parseConfig({ profileRoot: '/var/lib/openchamber-server-browser/profiles' }).profileRoot,
+    '/var/lib/openchamber-server-browser/profiles');
+  assert.equal(parseConfig({ profileRoot: null }).profileRoot, null);
+  assert.throws(() => parseConfig({ profileRoot: 'profiles' }), /must be an absolute path/);
+  assert.throws(() => parseConfig({ profileRoot: '' }), /non-empty absolute path or null/);
+  assert.throws(() => parseConfig({ profileRoot: 42 }), /non-empty absolute path or null/);
 });
 
 test('normalizes explicit origins into exact host and port grants', () => {

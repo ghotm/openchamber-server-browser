@@ -3640,7 +3640,7 @@ var require_websocket_server = __commonJS({
 });
 
 // src/main.js
-import path3 from "node:path";
+import path4 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/inspector.js
@@ -4711,6 +4711,7 @@ var createBrowserManager = ({
 
 // src/browser-runtime.js
 import crypto4 from "node:crypto";
+import path3 from "node:path";
 
 // node_modules/@openchamber/sdk/dist/scrollbar-style.js
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
@@ -5645,15 +5646,16 @@ var probeVersion = async (endpoint) => {
     cdp.close();
   }
 };
-var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) => {
+var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3, userDataDir = null } = {}) => {
   let launchPromise = null;
   let child = null;
   let profileDir = null;
+  let persistentProfile = false;
   let result = null;
   let closed = false;
   const exitListeners = /* @__PURE__ */ new Set();
   const removeProfile = async () => {
-    if (!profileDir) return;
+    if (!profileDir || persistentProfile) return;
     const directory = profileDir;
     profileDir = null;
     await fs.promises.rm(directory, { recursive: true, force: true });
@@ -5675,10 +5677,36 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
     if (!processToWait || processToWait.exitCode !== null || processToWait.signalCode !== null) return Promise.resolve();
     return new Promise((resolve) => processToWait.once("exit", resolve));
   };
+  const exitedWithin = async (processToWait, timeoutMs) => {
+    if (!processToWait || processToWait.exitCode !== null || processToWait.signalCode !== null) return true;
+    return Promise.race([
+      waitForExit(processToWait).then(() => true),
+      wait(timeoutMs).then(() => false)
+    ]);
+  };
+  const requestGracefulClose = async (endpoint) => {
+    try {
+      const cdp = await connectCdp(endpoint, { commandTimeoutMs: 2e3 });
+      try {
+        await cdp.send("Browser.close");
+      } finally {
+        cdp.close();
+      }
+    } catch {
+    }
+  };
   const launch = async () => {
     const binary = resolveChromePath(chromePath);
-    profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openchamber-server-browser-"));
-    await fs.promises.chmod(profileDir, 448);
+    if (userDataDir) {
+      profileDir = userDataDir;
+      persistentProfile = true;
+      await fs.promises.mkdir(profileDir, { recursive: true, mode: 448 });
+      await fs.promises.chmod(profileDir, 448);
+      await fs.promises.rm(path.join(profileDir, "DevToolsActivePort"), { force: true });
+    } else {
+      profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openchamber-server-browser-"));
+      await fs.promises.chmod(profileDir, 448);
+    }
     if (closed) throw new Error("Chrome launch was cancelled");
     child = spawn(binary, [
       "--headless=new",
@@ -5744,11 +5772,18 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
       closed = true;
       const processToWait = child;
       const exited = waitForExit(processToWait);
-      killChild();
+      const endpoint = result?.endpoint;
+      if (persistentProfile && endpoint) {
+        await requestGracefulClose(endpoint);
+        if (!await exitedWithin(processToWait, 1500)) killChild();
+      } else {
+        killChild();
+      }
       await launchPromise?.catch(() => {
       });
       await exited;
       await removeProfile();
+      profileDir = null;
       child = null;
       result = null;
     },
@@ -6189,8 +6224,8 @@ var createMarkCdp = ({
     };
   };
   const frameSelector = async (session, backendNodeId) => {
-    const path4 = await selectorForNode(session, backendNodeId);
-    return path4.shadowPath.length > 0 ? path4.shadowPath.join(" >>> ") : path4.selector;
+    const path5 = await selectorForNode(session, backendNodeId);
+    return path5.shadowPath.length > 0 ? path5.shadowPath.join(" >>> ") : path5.selector;
   };
   const findFrameOwner = async (parentSession, targetFrameId) => {
     try {
@@ -6228,9 +6263,9 @@ var createMarkCdp = ({
       return [];
     }
     const parentPath = await framePath(parentId);
-    const path4 = [...parentPath, selector];
-    framePaths.set(targetFrameId, path4);
-    return path4;
+    const path5 = [...parentPath, selector];
+    framePaths.set(targetFrameId, path5);
+    return path5;
   };
   const queryPath = async (session, rootNodeId, segments) => {
     if (!Array.isArray(segments) || segments.length === 0) return null;
@@ -6280,7 +6315,7 @@ var createMarkCdp = ({
       if (!node) return null;
       const hitFrameId = node.frameId ?? location.frameId;
       if (isFrameNode(node) && hitFrameId) {
-        const path4 = await framePath(hitFrameId);
+        const path5 = await framePath(hitFrameId);
         const box = await boxModelFor(session, node);
         const content = quadRect(box?.content);
         const childSession = await attachFrame(hitFrameId);
@@ -6294,7 +6329,7 @@ var createMarkCdp = ({
             frameId: hitFrameId
           };
         }
-        selectors = path4.length > 0 ? path4 : [await frameSelector(session, node.backendNodeId)];
+        selectors = path5.length > 0 ? path5 : [await frameSelector(session, node.backendNodeId)];
         if (content) {
           px -= content.x;
           py -= content.y;
@@ -6403,7 +6438,7 @@ var createMarkCdp = ({
     }
   };
   const describeHit = async (hit) => {
-    const path4 = await selectorForNode(hit.session, hit.node.backendNodeId);
+    const path5 = await selectorForNode(hit.session, hit.node.backendNodeId);
     const info = await elementInfo(hit.session, hit.node.backendNodeId);
     const frameSelectors = Array.isArray(hit.frameSelectors) && hit.frameSelectors.length > 0 ? hit.frameSelectors : hit.frameId && hit.frameId !== mainFrame ? await framePath(hit.frameId) : [];
     let rect = null;
@@ -6418,10 +6453,10 @@ var createMarkCdp = ({
       };
     }
     return {
-      selector: path4.selector ?? "",
-      shadowHostSelector: path4.shadowHostSelector ?? "",
-      shadowSelector: path4.shadowSelector ?? "",
-      shadowPath: Array.isArray(path4.shadowPath) ? path4.shadowPath : [],
+      selector: path5.selector ?? "",
+      shadowHostSelector: path5.shadowHostSelector ?? "",
+      shadowSelector: path5.shadowSelector ?? "",
+      shadowPath: Array.isArray(path5.shadowPath) ? path5.shadowPath : [],
       frameSelectors,
       frameUrl: frameSelectors.length > 0 ? info.frameUrl ?? "" : "",
       frameTitle: frameSelectors.length > 0 ? info.frameTitle ?? "" : "",
@@ -7116,9 +7151,19 @@ var parseConfig = (value) => {
   if (value.discoverDevServers !== void 0 && typeof value.discoverDevServers !== "boolean") {
     throw new Error("config.discoverDevServers must be true or false");
   }
+  const profileRoot = value.profileRoot;
+  if (profileRoot !== void 0 && profileRoot !== null) {
+    if (typeof profileRoot !== "string" || profileRoot.trim().length === 0) {
+      throw new Error("config.profileRoot must be a non-empty absolute path or null");
+    }
+    if (!path2.isAbsolute(profileRoot.trim())) {
+      throw new Error("config.profileRoot must be an absolute path");
+    }
+  }
   const allowedOrigins = (value.allowedOrigins ?? []).map(parseAllowedOrigin);
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
+    profileRoot: profileRoot?.trim() ?? null,
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
     allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
     discoverDevServers: value.discoverDevServers === true
@@ -7578,14 +7623,24 @@ var createTab = (targetId, sessionId, openerId) => ({
   markSwallowKeyUp: false
 });
 var isScopePage = (info, contextId) => info?.type === "page" && info.browserContextId === contextId && info.subtype !== "prerender";
+var persistentProfileDir = (profileRoot, scope) => {
+  if (typeof scope?.directory !== "string" || scope.directory.length === 0 || typeof scope?.sessionId !== "string" || scope.sessionId.length === 0) {
+    throw new Error("config.profileRoot requires a browser scope with project and chat context");
+  }
+  const key = crypto4.createHash("sha256").update(scope.directory).update("\0").update(scope.sessionId).digest("hex").slice(0, 32);
+  return path3.join(profileRoot, key);
+};
 var createBrowserRuntime = ({
   chromePath = null,
+  profileRoot = null,
+  scope = null,
   allowedOrigins = [],
   allowedNetworks = [],
   configPath = null,
   devServers = null
 } = {}) => {
-  const chrome = createChromeProcess({ chromePath });
+  const userDataDir = profileRoot ? persistentProfileDir(profileRoot, scope) : null;
+  const chrome = createChromeProcess({ chromePath, userDataDir });
   const proxy = createPolicyProxy({
     grants: [...originGrants(allowedOrigins), ...networkGrants(allowedNetworks)],
     configPath,
@@ -8497,8 +8552,8 @@ var createDevServerScanner = ({
       return devServerGrants(listeners, (listener) => listener.pid === null || excluded.has(listener.pid));
     }
     if (platform !== "linux") return [];
-    const tables = await Promise.all([["/proc/net/tcp", 4], ["/proc/net/tcp6", 6]].map(async ([path4, family]) => {
-      const table = await files.readFile(path4, "utf8").catch(() => null);
+    const tables = await Promise.all([["/proc/net/tcp", 4], ["/proc/net/tcp6", 6]].map(async ([path5, family]) => {
+      const table = await files.readFile(path5, "utf8").catch(() => null);
       return table === null ? null : parseProcListeners(table, family);
     }));
     if (tables.every((table) => table === null)) return [];
@@ -8954,7 +9009,7 @@ var startService = async ({
   const config = loadConfig({ entryUrl: import.meta.url, configPath });
   const devServers = config.discoverDevServers ? createDevServerScanner() : null;
   const browserRuntime = runtime ?? createBrowserManager({
-    createRuntime: () => createBrowserRuntime({ ...config, devServers })
+    createRuntime: (context) => createBrowserRuntime({ ...config, devServers, scope: context })
   });
   const service = createService({
     runtime: browserRuntime,
@@ -8964,7 +9019,7 @@ var startService = async ({
   await service.listen();
   return service;
 };
-var isMain = process.argv[1] && path3.resolve(process.argv[1]) === fileURLToPath2(import.meta.url);
+var isMain = process.argv[1] && path4.resolve(process.argv[1]) === fileURLToPath2(import.meta.url);
 if (isMain) {
   startService().then((service) => {
     let stopping = false;

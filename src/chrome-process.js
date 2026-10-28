@@ -65,16 +65,17 @@ const probeVersion = async (endpoint) => {
   }
 };
 
-export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_000 } = {}) => {
+export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_000, userDataDir = null } = {}) => {
   let launchPromise = null;
   let child = null;
   let profileDir = null;
+  let persistentProfile = false;
   let result = null;
   let closed = false;
   const exitListeners = new Set();
 
   const removeProfile = async () => {
-    if (!profileDir) return;
+    if (!profileDir || persistentProfile) return;
     const directory = profileDir;
     profileDir = null;
     await fs.promises.rm(directory, { recursive: true, force: true });
@@ -93,10 +94,37 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
     return new Promise((resolve) => processToWait.once('exit', resolve));
   };
 
+  const exitedWithin = async (processToWait, timeoutMs) => {
+    if (!processToWait || processToWait.exitCode !== null || processToWait.signalCode !== null) return true;
+    return Promise.race([
+      waitForExit(processToWait).then(() => true),
+      wait(timeoutMs).then(() => false),
+    ]);
+  };
+
+  // SIGKILL leaves a persistent profile with unflushed cookie and storage
+  // writes. Ask Chrome to close itself first, then fall back to a kill.
+  const requestGracefulClose = async (endpoint) => {
+    try {
+      const cdp = await connectCdp(endpoint, { commandTimeoutMs: 1_000, handshakeTimeoutMs: 1_000 });
+      try { await cdp.send('Browser.close'); } finally { cdp.close(); }
+    } catch {}
+  };
+
   const launch = async () => {
     const binary = resolveChromePath(chromePath);
-    profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-'));
-    await fs.promises.chmod(profileDir, 0o700);
+    if (userDataDir) {
+      profileDir = userDataDir;
+      persistentProfile = true;
+      await fs.promises.mkdir(profileDir, { recursive: true, mode: 0o700 });
+      await fs.promises.chmod(profileDir, 0o700);
+      // A previous shutdown leaves the old port here; reading it before this
+      // Chrome rewrites it would connect to a dead endpoint.
+      await fs.promises.rm(path.join(profileDir, 'DevToolsActivePort'), { force: true });
+    } else {
+      profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-'));
+      await fs.promises.chmod(profileDir, 0o700);
+    }
     if (closed) throw new Error('Chrome launch was cancelled');
     child = spawn(binary, [
       '--headless=new',
@@ -161,10 +189,17 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       closed = true;
       const processToWait = child;
       const exited = waitForExit(processToWait);
-      killChild();
+      const endpoint = result?.endpoint;
+      if (persistentProfile && endpoint) {
+        await requestGracefulClose(endpoint);
+        if (!(await exitedWithin(processToWait, 1_000))) killChild();
+      } else {
+        killChild();
+      }
       await launchPromise?.catch(() => {});
       await exited;
       await removeProfile();
+      profileDir = null;
       child = null;
       result = null;
     },

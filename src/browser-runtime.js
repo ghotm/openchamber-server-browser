@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { GUEST_CLIPBOARD_TEXT_MAX } from '@openchamber/sdk';
 import { createBrowserActions } from './browser-actions.js';
 import { connectCdp } from './cdp-client.js';
@@ -59,14 +60,34 @@ const isScopePage = (info, contextId) => info?.type === 'page'
   && info.browserContextId === contextId
   && info.subtype !== 'prerender';
 
+// Each chat gets its own durable profile, so two live scopes never open the
+// same Chrome profile directory at once. Reopening the chat, or coming back
+// after the idle stop, reuses its cookies and storage.
+const persistentProfileDir = (profileRoot, scope) => {
+  if (typeof scope?.directory !== 'string' || scope.directory.length === 0
+    || typeof scope?.sessionId !== 'string' || scope.sessionId.length === 0) {
+    throw new Error('config.profileRoot requires a browser scope with project and chat context');
+  }
+  const key = crypto.createHash('sha256')
+    .update(scope.directory)
+    .update('\0')
+    .update(scope.sessionId)
+    .digest('hex')
+    .slice(0, 32);
+  return path.join(profileRoot, key);
+};
+
 export const createBrowserRuntime = ({
   chromePath = null,
+  profileRoot = null,
+  scope = null,
   allowedOrigins = [],
   allowedNetworks = [],
   configPath = null,
   devServers = null,
 } = {}) => {
-  const chrome = createChromeProcess({ chromePath });
+  const userDataDir = profileRoot ? persistentProfileDir(profileRoot, scope) : null;
+  const chrome = createChromeProcess({ chromePath, userDataDir });
   const proxy = createPolicyProxy({
     grants: [...originGrants(allowedOrigins), ...networkGrants(allowedNetworks)],
     configPath,

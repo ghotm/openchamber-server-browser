@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { createBrowserManager } from '../src/browser-manager.js';
 import { createBrowserRuntime } from '../src/browser-runtime.js';
@@ -268,6 +270,27 @@ test('removes the temporary Chrome profile on shutdown', { skip: chromePath ? fa
 
   assert.equal(fs.existsSync(profileDir), false);
   assert.notEqual(running.process.exitCode === null && running.process.signalCode === null, true);
+});
+
+test('keeps a configured Chrome profile across shutdown and relaunch', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-persistent-'));
+  context.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const profileDir = path.join(root, 'chat-profile');
+
+  const first = createChromeProcess({ chromePath, userDataDir: profileDir });
+  const running = await first.ensure();
+  assert.equal(running.profileDir, profileDir);
+  await first.close();
+  assert.equal(fs.existsSync(profileDir), true);
+  assert.notEqual(fs.readdirSync(profileDir).length, 0);
+
+  const second = createChromeProcess({ chromePath, userDataDir: profileDir });
+  try {
+    await second.ensure();
+  } finally {
+    await second.close();
+  }
+  assert.equal(fs.existsSync(profileDir), true);
 });
 
 test('stops Chrome at once on close even when its page no longer answers', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {

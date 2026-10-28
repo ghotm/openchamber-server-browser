@@ -66,9 +66,19 @@ export const parseConfig = (value) => {
   if (value.discoverDevServers !== undefined && typeof value.discoverDevServers !== 'boolean') {
     throw new Error('config.discoverDevServers must be true or false');
   }
+  const profileRoot = value.profileRoot;
+  if (profileRoot !== undefined && profileRoot !== null) {
+    if (typeof profileRoot !== 'string' || profileRoot.trim().length === 0) {
+      throw new Error('config.profileRoot must be a non-empty absolute path or null');
+    }
+    if (!path.isAbsolute(profileRoot.trim())) {
+      throw new Error('config.profileRoot must be an absolute path');
+    }
+  }
   const allowedOrigins = (value.allowedOrigins ?? []).map(parseAllowedOrigin);
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
+    profileRoot: profileRoot?.trim() ?? null,
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
     allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
     discoverDevServers: value.discoverDevServers === true,
