@@ -375,6 +375,46 @@ test('applies and removes native select compatibility without reloading page sta
 });
 
 
+test('flushes coalesced pointer moves before a click', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  })).result.value;
+  await evaluate(`(() => {
+    window.inputOrder = [];
+    const record = (name) => (event) => {
+      window.inputOrder.push(name + ':' + Math.round(event.clientX) + ',' + Math.round(event.clientY));
+    };
+    addEventListener('pointermove', record('move'), true);
+    addEventListener('pointerdown', record('down'), true);
+    addEventListener('pointerup', record('up'), true);
+    document.querySelector('#surface').addEventListener('click', () => window.inputOrder.push('click'));
+  })()`);
+  const pointer = (action, x, y, buttons) => ({ type: 'pointer', action, x, y, button: 0, buttons, modifiers });
+
+  // Given two hover moves before a click, the last move reaches the page before the press.
+  await runtime.surfaceInput([
+    pointer('move', 20, 20, 0),
+    pointer('move', 30, 30, 0),
+    pointer('down', 30, 30, 1),
+    pointer('up', 30, 30, 0),
+  ]);
+  await waitFor(async () => (await evaluate('window.inputOrder.length')) >= 4);
+
+  assert.deepEqual(JSON.parse(await evaluate('JSON.stringify(window.inputOrder)')), [
+    'move:30,30',
+    'down:30,30',
+    'up:30,30',
+    'click',
+  ]);
+});
+
 test('types editing keys, Enter, select-all, and composed characters like a local keyboard', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
   // Given a page with a textarea and a single-field form.
   const web = await startWebFixture();
@@ -838,6 +878,74 @@ test('marks an element inside a same-origin iframe and keeps the frame chain', {
   await runtime.handleMarkInput({ type: 'pointer', action: 'down', button: 2, x: 5, y: 5 }, page);
   assert.equal(runtime.markState.active, false);
   assert.equal(runtime.markState.marks.length, 1);
+});
+
+test('draws and hides the marker box from page-local pointer moves', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page with a frame and an armed marker.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/copy` });
+  const page = await runtime.ensurePage();
+  const contexts = [];
+  const off = page.cdp.onEvent((event) => {
+    if (event.method === 'Runtime.executionContextCreated' && event.sessionId === page.sessionId) {
+      contexts.push(event.params.context);
+    }
+  });
+  await page.cdp.sendSession(page.sessionId, 'Runtime.enable');
+  await runtime.startMark('local-hover');
+  let contextId = null;
+  await waitFor(() => {
+    contextId = contexts.find((candidate) => candidate.name === 'openchamber-mark')?.id ?? null;
+    return Number.isInteger(contextId);
+  });
+  const read = async () => {
+    const response = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+      contextId,
+      expression: 'globalThis.__openchamberMark?.describe?.() ?? null',
+      returnByValue: true,
+    });
+    return response.result?.value ?? null;
+  };
+  const move = (x, y) => runtime.surfaceInput([
+    { type: 'pointer', action: 'move', x, y, button: 0, buttons: 0, modifiers },
+  ]);
+  const centerOf = async (selector) => {
+    const response = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+      expression: `(() => {
+        const rect = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      })()`,
+      returnByValue: true,
+    });
+    return response.result.value;
+  };
+
+  // When the pointer moves over the input, then the page-local overlay draws it without a service hit test.
+  await move(...Object.values(await centerOf('#secret')));
+  await waitFor(async () => /input#secret/.test((await read())?.label ?? ''));
+  const overInput = await read();
+  assert.equal(overInput.hidden, false);
+  assert.ok(Number.parseFloat(overInput.width) > 0);
+
+  // But an iframe hides the box locally instead of recursing into its document.
+  await move(...Object.values(await centerOf('#frame')));
+  await waitFor(async () => (await read())?.hidden === true);
+
+  // A stop with a hover frame still queued keeps the box hidden instead of letting the rAF draw it again.
+  await move(...Object.values(await centerOf('#secret')));
+  await waitFor(async () => (await read())?.hidden === false);
+  await move(21, 21);
+  await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    contextId,
+    expression: 'globalThis.__openchamberMark.stop()',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal((await read()).hidden, true);
+
+  off();
 });
 
 test('closes this chat\'s tabs without creating one', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {

@@ -49,6 +49,27 @@ const parseAllowedNetwork = (value, index) => {
 
 export const extensionRootFrom = (entryUrl) => path.resolve(path.dirname(fileURLToPath(entryUrl)), '..');
 
+export const DEFAULT_SURFACE = Object.freeze({
+  quality: 72,
+  everyNthFrame: 1,
+});
+
+const parseSurface = (value) => {
+  if (value === undefined) return DEFAULT_SURFACE;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('config.surface must be an object');
+  }
+  const quality = value.quality === undefined ? DEFAULT_SURFACE.quality : value.quality;
+  const everyNthFrame = value.everyNthFrame === undefined ? DEFAULT_SURFACE.everyNthFrame : value.everyNthFrame;
+  if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
+    throw new Error('config.surface.quality must be an integer from 1 to 100');
+  }
+  if (!Number.isInteger(everyNthFrame) || everyNthFrame < 1 || everyNthFrame > 10) {
+    throw new Error('config.surface.everyNthFrame must be an integer from 1 to 10');
+  }
+  return Object.freeze({ quality, everyNthFrame });
+};
+
 export const parseConfig = (value) => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('config.json must contain an object');
@@ -79,6 +100,7 @@ export const parseConfig = (value) => {
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
     profileRoot: profileRoot?.trim() ?? null,
+    surface: parseSurface(value.surface),
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
     allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
     discoverDevServers: value.discoverDevServers === true,

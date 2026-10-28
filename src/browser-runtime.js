@@ -11,13 +11,12 @@ import {
   MARK_LIMIT,
   MARK_WORLD,
   cancelMark as cancelMarkOverlay,
-  clearMarkHighlight,
+  hideMarkOverlay,
   installMark,
   resolveMarkItems,
   sanitizeMarkPayload,
-  setMarkHighlight,
 } from './mark.js';
-import { networkGrants, originGrants } from './config.js';
+import { DEFAULT_SURFACE, networkGrants, originGrants } from './config.js';
 import { createNativeSelectCompatibility } from './native-select-compatibility.js';
 import { createPolicyProxy } from './policy-proxy.js';
 import { createSurface } from './surface.js';
@@ -50,8 +49,6 @@ const createTab = (targetId, sessionId, openerId) => ({
   markContextId: null,
   markFrameContexts: [],
   markCdp: null,
-  markHoverAt: 0,
-  markHoverBusy: false,
   markSwallowPointerUp: false,
   markSwallowKeyUp: false,
 });
@@ -85,6 +82,7 @@ export const createBrowserRuntime = ({
   allowedNetworks = [],
   configPath = null,
   devServers = null,
+  surface = DEFAULT_SURFACE,
 } = {}) => {
   const userDataDir = profileRoot ? persistentProfileDir(profileRoot, scope) : null;
   const chrome = createChromeProcess({ chromePath, userDataDir });
@@ -226,8 +224,6 @@ export const createBrowserRuntime = ({
     current.markFrameContexts = [];
     current.markCdp?.close?.();
     current.markCdp = null;
-    current.markHoverAt = 0;
-    current.markHoverBusy = false;
     current.markSwallowPointerUp = false;
     current.markSwallowKeyUp = false;
   };
@@ -358,7 +354,7 @@ export const createBrowserRuntime = ({
     activations += 1;
     current.lastActive = activations;
     void contextMenu.close();
-    surface.retarget();
+    surfaceController.retarget();
     notifyTabs();
     // Chrome can defer input and frames for a page that is not in front.
     await cdp.sendSession(current.sessionId, 'Page.bringToFront').catch(() => {});
@@ -377,7 +373,7 @@ export const createBrowserRuntime = ({
       return;
     }
     activeTargetId = null;
-    surface.retarget();
+    surfaceController.retarget();
     const fallback = tabs.get(current.openerId)
       ?? [...tabs.values()].reduce((best, candidate) => (!best || candidate.lastActive > best.lastActive ? candidate : best), null);
     if (fallback) void activate(fallback);
@@ -662,28 +658,6 @@ export const createBrowserRuntime = ({
     return resolveMarksFor(current);
   };
 
-  runtime.markHover = async (current, point) => {
-    const resolver = current?.markCdp;
-    if (!resolver || current.markHoverBusy) return;
-    const now = Date.now();
-    if (now - current.markHoverAt < 40) return;
-    current.markHoverAt = now;
-    current.markHoverBusy = true;
-    try {
-      const highlight = await resolver.hoverAt(point);
-      if (!current.markActive || current.markCdp !== resolver || current.markContextId === null) return;
-      if (highlight) {
-        await setMarkHighlight(pageOf(current), current.markContextId, highlight);
-      } else {
-        await clearMarkHighlight(pageOf(current), current.markContextId);
-      }
-    } catch {
-      // A stale hit or a frame that went away only loses this hover frame.
-    } finally {
-      current.markHoverBusy = false;
-    }
-  };
-
   runtime.handleMarkInput = async (event, page) => {
     const current = activeTab();
     if (!current) return false;
@@ -700,6 +674,8 @@ export const createBrowserRuntime = ({
       if (event.action === 'down' && event.button === 0) {
         const contexts = current.markFrameContexts.slice();
         const resolver = current.markCdp;
+        const contextId = current.markContextId;
+        if (contextId !== null) void hideMarkOverlay(pageOf(current), contextId);
         let payload = null;
         if (resolver) {
           payload = await resolver.describeAt({ x: event.x, y: event.y }).catch(() => null);
@@ -714,10 +690,6 @@ export const createBrowserRuntime = ({
         await cancelMarkMode();
         current.markSwallowPointerUp = true;
         return true;
-      }
-      if (event.action === 'move') {
-        void runtime.markHover(current, { x: event.x, y: event.y });
-        return false;
       }
       return true;
     }
@@ -833,12 +805,12 @@ export const createBrowserRuntime = ({
   };
 
   const execute = createBrowserActions(runtime);
-  const surface = createSurface(runtime);
+  const surfaceController = createSurface(runtime, surface);
 
   let copyRequest = null;
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
-    readSelection: () => surface.clipboard(),
+    readSelection: () => surfaceController.clipboard(),
     onAction: (action, selection) => {
       if (action === 'back' || action === 'forward' || action === 'reload') {
         void runtime.command(action).catch(() => {});
@@ -886,11 +858,11 @@ export const createBrowserRuntime = ({
     return operation;
   };
 
-  runtime.surfaceFrame = (request) => surface.frame(request);
-  runtime.surfaceInput = (events, theme) => surface.input(events, theme);
-  runtime.surfaceControl = (controller) => surface.control(controller);
-  runtime.surfaceResize = (size) => surface.resize(size);
-  runtime.surfaceClipboard = () => surface.clipboard();
+  runtime.surfaceFrame = (request) => surfaceController.frame(request);
+  runtime.surfaceInput = (events, theme) => surfaceController.input(events, theme);
+  runtime.surfaceControl = (controller) => surfaceController.control(controller);
+  runtime.surfaceResize = (size) => surfaceController.resize(size);
+  runtime.surfaceClipboard = () => surfaceController.clipboard();
   runtime.onDead = (listener) => {
     deathListeners.add(listener);
     return () => deathListeners.delete(listener);
@@ -908,7 +880,7 @@ export const createBrowserRuntime = ({
     // kill, and fails the CDP calls that the work below may still wait on.
     await chrome.close();
     cdp?.close();
-    await surface.close();
+    await surfaceController.close();
     inspector.close();
     await pagePromise?.catch(() => {});
     await actionQueue.catch(() => {});

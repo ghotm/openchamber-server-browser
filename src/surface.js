@@ -1,4 +1,6 @@
 import { SURFACE_FRAME_MAX_BYTES, SURFACE_TEXT_MAX } from '@openchamber/sdk';
+import { DEFAULT_SURFACE } from './config.js';
+import { coalesceSurfaceEvents } from './input-events.js';
 
 const BUTTON_NAMES = ['left', 'middle', 'right'];
 const KEY_CODES = Object.freeze({
@@ -110,7 +112,7 @@ const stopScreencast = (page) => {
   if (page?.cdp.isOpen) void page.cdp.sendSession(page.sessionId, 'Page.stopScreencast').catch(() => {});
 };
 
-export const createSurface = (runtime) => {
+export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
   const waiters = new Set();
   let page = null;
   let unsubscribe = null;
@@ -173,8 +175,8 @@ export const createSurface = (runtime) => {
       try {
         await current.cdp.sendSession(current.sessionId, 'Page.startScreencast', {
           format: 'jpeg',
-          quality: 72,
-          everyNthFrame: 1,
+          quality: surfaceConfig.quality,
+          everyNthFrame: surfaceConfig.everyNthFrame,
         });
       } catch (error) {
         detach();
@@ -228,7 +230,25 @@ export const createSurface = (runtime) => {
     async input(events, theme = null) {
       const current = await start();
       const menu = runtime.contextMenu;
-      for (const event of events) {
+      const pendingMoves = [];
+      let pendingError = null;
+      const flushPendingMoves = async () => {
+        if (pendingMoves.length > 0) await Promise.all(pendingMoves.splice(0));
+        if (!pendingError) return;
+        const error = pendingError;
+        pendingError = null;
+        throw error;
+      };
+      for (const event of coalesceSurfaceEvents(events)) {
+        if (event.type === 'pointer' && event.action === 'move') {
+          pendingMoves.push(dispatchInput(current, event).catch((error) => {
+            pendingError ??= error ?? new Error('Pointer move failed');
+          }));
+          continue;
+        }
+        // Mark confirmation, the context menu, keys, and clicks must see the
+        // page after every move that preceded them.
+        await flushPendingMoves();
         if (await runtime.handleMarkInput?.(event, current)) continue;
         if (event.type === 'key' && event.key === 'Escape' && event.action === 'up' && swallowEscapeUp) {
           swallowEscapeUp = false;
@@ -249,6 +269,7 @@ export const createSurface = (runtime) => {
         await dispatchInput(current, event);
         if (secondary && event.action === 'up') await menu.settle(current, theme).catch(() => {});
       }
+      await flushPendingMoves();
     },
     control(controller) {
       // The manager repeats the viewer's claim with every input batch; only a

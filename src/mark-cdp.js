@@ -500,29 +500,6 @@ export const createMarkCdp = ({
     };
   };
 
-  const hoverAt = async ({ x, y }) => {
-    const hit = await hitAt({ x, y });
-    if (!hit) return null;
-    const box = await boxModelFor(hit.session, hit.node);
-    const quad = quadRect(box?.border) ?? quadRect(box?.content);
-    if (!quad) return null;
-    const attributes = attrMap(hit.node.attributes);
-    const tag = nodeName(hit.node) || 'element';
-    const identifier = attributes.id ? `#${attributes.id}` : '';
-    const classes = attributes.class
-      ? `.${attributes.class.trim().split(/\s+/).filter(Boolean).slice(0, 2).join('.')}`
-      : '';
-    return {
-      rect: {
-        x: quad.x + (hit.session === mainSession ? 0 : hit.offsetX),
-        y: quad.y + (hit.session === mainSession ? 0 : hit.offsetY),
-        width: quad.width,
-        height: quad.height,
-      },
-      label: `${tag}${identifier}${classes}`,
-    };
-  };
-
   const resolveOne = async (item) => {
     let session = mainSession;
     let root = (await documentFor(mainSession)).root.nodeId;
@@ -577,7 +554,6 @@ export const createMarkCdp = ({
       const hit = await hitAt(point);
       return hit ? describeHit(hit) : null;
     },
-    hoverAt,
     resolve: async (items) => {
       const results = [];
       for (const item of Array.isArray(items) ? items : []) {

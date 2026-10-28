@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { networkGrants, originGrants, parseConfig } from '../src/config.js';
+import { DEFAULT_SURFACE, networkGrants, originGrants, parseConfig } from '../src/config.js';
 
 test('defaults to no private origin grants', () => {
   const config = parseConfig({});
@@ -8,6 +8,7 @@ test('defaults to no private origin grants', () => {
   assert.deepEqual(config, {
     chromePath: null,
     profileRoot: null,
+    surface: DEFAULT_SURFACE,
     allowedOrigins: [],
     allowedNetworks: [],
     discoverDevServers: false,
@@ -73,4 +74,25 @@ test('rejects network blocks that are public, too broad, or missing explicit por
 test('turns development-server discovery on only with an explicit boolean', () => {
   assert.equal(parseConfig({ discoverDevServers: true }).discoverDevServers, true);
   assert.throws(() => parseConfig({ discoverDevServers: 'yes' }), /discoverDevServers must be true or false/);
+});
+
+test('keeps the current surface defaults and accepts explicit frame settings', () => {
+  assert.deepEqual(parseConfig({}).surface, { quality: 72, everyNthFrame: 1 });
+  assert.deepEqual(parseConfig({ surface: { quality: 60, everyNthFrame: 2 } }).surface,
+    { quality: 60, everyNthFrame: 2 });
+  for (const surface of [
+    { quality: 0 },
+    { quality: 101 },
+    { quality: 60.5 },
+    { quality: '60' },
+    { quality: null },
+    { everyNthFrame: 0 },
+    { everyNthFrame: 11 },
+    { everyNthFrame: 1.5 },
+    { everyNthFrame: '1' },
+    { everyNthFrame: null },
+  ]) {
+    assert.throws(() => parseConfig({ surface }), /config\.surface\./);
+  }
+  assert.throws(() => parseConfig({ surface: [] }), /config\.surface must be an object/);
 });

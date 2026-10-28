@@ -1,4 +1,8 @@
 {
   "allowedOrigins": ["http://127.0.0.1:3000", "http://localhost:3000"],
-  "discoverDevServers": false
+  "discoverDevServers": false,
+  "surface": {
+    "quality": 72,
+    "everyNthFrame": 1
+  }
 }

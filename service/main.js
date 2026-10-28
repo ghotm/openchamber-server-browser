@@ -5686,7 +5686,7 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3, userDat
   };
   const requestGracefulClose = async (endpoint) => {
     try {
-      const cdp = await connectCdp(endpoint, { commandTimeoutMs: 2e3 });
+      const cdp = await connectCdp(endpoint, { commandTimeoutMs: 1e3, handshakeTimeoutMs: 1e3 });
       try {
         await cdp.send("Browser.close");
       } finally {
@@ -5775,7 +5775,7 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3, userDat
       const endpoint = result?.endpoint;
       if (persistentProfile && endpoint) {
         await requestGracefulClose(endpoint);
-        if (!await exitedWithin(processToWait, 1500)) killChild();
+        if (!await exitedWithin(processToWait, 1e3)) killChild();
       } else {
         killChild();
       }
@@ -6470,26 +6470,6 @@ var createMarkCdp = ({
       title
     };
   };
-  const hoverAt = async ({ x, y }) => {
-    const hit = await hitAt({ x, y });
-    if (!hit) return null;
-    const box = await boxModelFor(hit.session, hit.node);
-    const quad = quadRect(box?.border) ?? quadRect(box?.content);
-    if (!quad) return null;
-    const attributes = attrMap(hit.node.attributes);
-    const tag = nodeName(hit.node) || "element";
-    const identifier = attributes.id ? `#${attributes.id}` : "";
-    const classes = attributes.class ? `.${attributes.class.trim().split(/\s+/).filter(Boolean).slice(0, 2).join(".")}` : "";
-    return {
-      rect: {
-        x: quad.x + (hit.session === mainSession ? 0 : hit.offsetX),
-        y: quad.y + (hit.session === mainSession ? 0 : hit.offsetY),
-        width: quad.width,
-        height: quad.height
-      },
-      label: `${tag}${identifier}${classes}`
-    };
-  };
   const resolveOne = async (item) => {
     let session = mainSession;
     let root = (await documentFor(mainSession)).root.nodeId;
@@ -6537,7 +6517,6 @@ var createMarkCdp = ({
       const hit = await hitAt(point);
       return hit ? describeHit(hit) : null;
     },
-    hoverAt,
     resolve: async (items) => {
       const results = [];
       for (const item of Array.isArray(items) ? items : []) {
@@ -6667,7 +6646,14 @@ function installMarkOverlay() {
   label.hidden = true;
   root.append(style, box, label);
   document.documentElement.append(host);
+  let lastPoint = null;
+  let hoverRaf = null;
+  let overFrame = false;
+  let stopped = false;
   const hide = () => {
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
     box.hidden = true;
     label.hidden = true;
   };
@@ -6683,27 +6669,108 @@ function installMarkOverlay() {
     label.style.left = `${Math.max(4, Math.min(left, innerWidth - labelWidth - 4))}px`;
     label.style.top = `${top > 24 ? top - 22 : top + height + 4}px`;
   };
-  const onViewportChange = () => hide();
-  addEventListener("scroll", onViewportChange, true);
-  addEventListener("resize", onViewportChange, true);
-  state.setHighlight = (highlight) => {
-    const rect = highlight?.rect;
-    if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)) {
+  const isFrame = (element) => element?.tagName === "IFRAME" || element?.tagName === "FRAME";
+  const hitAt = (x, y) => {
+    let element = document.elementFromPoint(x, y);
+    for (let depth = 0; depth < 8 && element?.shadowRoot; depth += 1) {
+      const inner = element.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === element) break;
+      element = inner;
+    }
+    return element;
+  };
+  const labelFor = (element) => {
+    const tag = String(element.tagName ?? "").toLowerCase();
+    const id = element.id ? `#${element.id}` : "";
+    const className = element.getAttribute?.("class") ?? "";
+    const classes = String(className).trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    return `${tag}${id}${classes.map((name) => `.${name}`).join("")}`;
+  };
+  const drawAt = (point) => {
+    const element = hitAt(point.x, point.y);
+    if (!element || isFrame(element)) {
+      overFrame = true;
+      lastPoint = null;
       hide();
       return;
     }
-    place(rect.x, rect.y, rect.width, rect.height, String(highlight.label ?? "element"));
+    const rect = element.getBoundingClientRect();
+    if (!(rect.width > 0 && rect.height > 0)) {
+      hide();
+      return;
+    }
+    place(rect.left, rect.top, rect.width, rect.height, labelFor(element));
   };
-  state.clearHighlight = hide;
+  const scheduleHover = () => {
+    if (stopped || hoverRaf !== null || overFrame || !lastPoint) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = null;
+      if (!stopped && lastPoint && !overFrame) drawAt(lastPoint);
+    });
+  };
+  const onPointerMove = (event) => {
+    if (stopped) return;
+    lastPoint = { x: event.clientX, y: event.clientY };
+    overFrame = false;
+    scheduleHover();
+  };
+  const onPointerOver = (event) => {
+    if (stopped || !isFrame(event.target)) return;
+    overFrame = true;
+    lastPoint = null;
+    hide();
+  };
+  const onPointerOut = (event) => {
+    if (stopped) return;
+    if (isFrame(event.target)) {
+      overFrame = false;
+      return;
+    }
+    if (isFrame(event.relatedTarget)) {
+      overFrame = true;
+      lastPoint = null;
+      hide();
+    }
+  };
+  const onViewportChange = () => {
+    if (stopped) return;
+    if (lastPoint && !overFrame) scheduleHover();
+    else hide();
+  };
+  addEventListener("pointermove", onPointerMove, true);
+  addEventListener("pointerover", onPointerOver, true);
+  addEventListener("pointerout", onPointerOut, true);
+  addEventListener("scroll", onViewportChange, true);
+  addEventListener("resize", onViewportChange, true);
+  state.stop = () => {
+    stopped = true;
+    overFrame = true;
+    hide();
+  };
+  state.describe = () => ({
+    hidden: box.hidden,
+    label: label.textContent,
+    left: box.style.left,
+    top: box.style.top,
+    width: box.style.width,
+    height: box.style.height
+  });
   state.cancel = () => {
+    removeEventListener("pointermove", onPointerMove, true);
+    removeEventListener("pointerover", onPointerOver, true);
+    removeEventListener("pointerout", onPointerOut, true);
     removeEventListener("scroll", onViewportChange, true);
     removeEventListener("resize", onViewportChange, true);
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
+    overFrame = false;
     host.remove();
     box.hidden = true;
     label.hidden = true;
     state.cancel = null;
-    state.setHighlight = null;
-    state.clearHighlight = null;
+    state.stop = null;
+    state.describe = null;
   };
   return { ok: true };
 }
@@ -6722,11 +6789,9 @@ var call2 = (page, contextId, fn, argument) => page.cdp.sendSession(page.session
 var installMark = async (page, contextId) => {
   await call2(page, contextId, installMarkOverlay);
 };
-var setMarkHighlight = async (page, contextId, highlight) => {
-  await call2(page, contextId, callMarkOverlay, { method: "setHighlight", argument: highlight });
-};
-var clearMarkHighlight = async (page, contextId) => {
-  await call2(page, contextId, callMarkOverlay, { method: "clearHighlight" }).catch(() => {
+var hideMarkOverlay = async (page, contextId) => {
+  if (!Number.isInteger(contextId)) return;
+  await call2(page, contextId, callMarkOverlay, { method: "stop" }).catch(() => {
   });
 };
 var cancelMark = async (page, contextId) => {
@@ -7134,6 +7199,25 @@ var parseAllowedNetwork = (value, index) => {
   return Object.freeze({ cidr: value.cidr, address: cidr[1], prefix, ports: parsePorts(value.ports, label) });
 };
 var extensionRootFrom = (entryUrl) => path2.resolve(path2.dirname(fileURLToPath(entryUrl)), "..");
+var DEFAULT_SURFACE = Object.freeze({
+  quality: 72,
+  everyNthFrame: 1
+});
+var parseSurface = (value) => {
+  if (value === void 0) return DEFAULT_SURFACE;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("config.surface must be an object");
+  }
+  const quality = value.quality === void 0 ? DEFAULT_SURFACE.quality : value.quality;
+  const everyNthFrame = value.everyNthFrame === void 0 ? DEFAULT_SURFACE.everyNthFrame : value.everyNthFrame;
+  if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
+    throw new Error("config.surface.quality must be an integer from 1 to 100");
+  }
+  if (!Number.isInteger(everyNthFrame) || everyNthFrame < 1 || everyNthFrame > 10) {
+    throw new Error("config.surface.everyNthFrame must be an integer from 1 to 10");
+  }
+  return Object.freeze({ quality, everyNthFrame });
+};
 var parseConfig = (value) => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("config.json must contain an object");
@@ -7164,6 +7248,7 @@ var parseConfig = (value) => {
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
     profileRoot: profileRoot?.trim() ?? null,
+    surface: parseSurface(value.surface),
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
     allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
     discoverDevServers: value.discoverDevServers === true
@@ -7318,6 +7403,38 @@ var createNativeSelectCompatibility = ({ ensurePage, reportError }) => {
   };
 };
 
+// src/input-events.js
+var MAX_DRAG_MOVES = 4;
+var isPointerMove = (event) => event?.type === "pointer" && event.action === "move";
+var isDragging = (event) => (Number(event?.buttons) || 0) !== 0;
+var sampleDrag = (run) => {
+  if (run.length <= MAX_DRAG_MOVES) return run;
+  const indexes = /* @__PURE__ */ new Set();
+  for (let index = 0; index < MAX_DRAG_MOVES; index += 1) {
+    indexes.add(Math.round(index * (run.length - 1) / (MAX_DRAG_MOVES - 1)));
+  }
+  return [...indexes].sort((left, right) => left - right).map((index) => run[index]);
+};
+var coalesceSurfaceEvents = (events) => {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  const result = [];
+  for (let index = 0; index < events.length; ) {
+    const event = events[index];
+    if (!isPointerMove(event)) {
+      result.push(event);
+      index += 1;
+      continue;
+    }
+    const run = [];
+    while (index < events.length && isPointerMove(events[index])) {
+      run.push(events[index]);
+      index += 1;
+    }
+    result.push(...run.some(isDragging) ? sampleDrag(run) : [run[run.length - 1]]);
+  }
+  return result;
+};
+
 // src/surface.js
 var BUTTON_NAMES = ["left", "middle", "right"];
 var KEY_CODES = Object.freeze({
@@ -7422,7 +7539,7 @@ var stopScreencast = (page) => {
   if (page?.cdp.isOpen) void page.cdp.sendSession(page.sessionId, "Page.stopScreencast").catch(() => {
   });
 };
-var createSurface = (runtime) => {
+var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
   const waiters = /* @__PURE__ */ new Set();
   let page = null;
   let unsubscribe = null;
@@ -7480,8 +7597,8 @@ var createSurface = (runtime) => {
       try {
         await current.cdp.sendSession(current.sessionId, "Page.startScreencast", {
           format: "jpeg",
-          quality: 72,
-          everyNthFrame: 1
+          quality: surfaceConfig.quality,
+          everyNthFrame: surfaceConfig.everyNthFrame
         });
       } catch (error) {
         detach();
@@ -7533,7 +7650,23 @@ var createSurface = (runtime) => {
     async input(events, theme = null) {
       const current = await start();
       const menu = runtime.contextMenu;
-      for (const event of events) {
+      const pendingMoves = [];
+      let pendingError = null;
+      const flushPendingMoves = async () => {
+        if (pendingMoves.length > 0) await Promise.all(pendingMoves.splice(0));
+        if (!pendingError) return;
+        const error = pendingError;
+        pendingError = null;
+        throw error;
+      };
+      for (const event of coalesceSurfaceEvents(events)) {
+        if (event.type === "pointer" && event.action === "move") {
+          pendingMoves.push(dispatchInput(current, event).catch((error) => {
+            pendingError ??= error ?? new Error("Pointer move failed");
+          }));
+          continue;
+        }
+        await flushPendingMoves();
         if (await runtime.handleMarkInput?.(event, current)) continue;
         if (event.type === "key" && event.key === "Escape" && event.action === "up" && swallowEscapeUp) {
           swallowEscapeUp = false;
@@ -7554,6 +7687,7 @@ var createSurface = (runtime) => {
         if (secondary && event.action === "up") await menu.settle(current, theme).catch(() => {
         });
       }
+      await flushPendingMoves();
     },
     control(controller) {
       if (runtime.controller !== controller) void runtime.contextMenu.close();
@@ -7617,8 +7751,6 @@ var createTab = (targetId, sessionId, openerId) => ({
   markContextId: null,
   markFrameContexts: [],
   markCdp: null,
-  markHoverAt: 0,
-  markHoverBusy: false,
   markSwallowPointerUp: false,
   markSwallowKeyUp: false
 });
@@ -7637,7 +7769,8 @@ var createBrowserRuntime = ({
   allowedOrigins = [],
   allowedNetworks = [],
   configPath = null,
-  devServers = null
+  devServers = null,
+  surface = DEFAULT_SURFACE
 } = {}) => {
   const userDataDir = profileRoot ? persistentProfileDir(profileRoot, scope) : null;
   const chrome = createChromeProcess({ chromePath, userDataDir });
@@ -7770,8 +7903,6 @@ var createBrowserRuntime = ({
     current.markFrameContexts = [];
     current.markCdp?.close?.();
     current.markCdp = null;
-    current.markHoverAt = 0;
-    current.markHoverBusy = false;
     current.markSwallowPointerUp = false;
     current.markSwallowKeyUp = false;
   };
@@ -7886,7 +8017,7 @@ var createBrowserRuntime = ({
     activations += 1;
     current.lastActive = activations;
     void contextMenu.close();
-    surface.retarget();
+    surfaceController.retarget();
     notifyTabs();
     await cdp.sendSession(current.sessionId, "Page.bringToFront").catch(() => {
     });
@@ -7904,7 +8035,7 @@ var createBrowserRuntime = ({
       return;
     }
     activeTargetId = null;
-    surface.retarget();
+    surfaceController.retarget();
     const fallback = tabs.get(current.openerId) ?? [...tabs.values()].reduce((best, candidate) => !best || candidate.lastActive > best.lastActive ? candidate : best, null);
     if (fallback) void activate(fallback);
     else notifyTabs();
@@ -8157,26 +8288,6 @@ var createBrowserRuntime = ({
     if (!current) return [];
     return resolveMarksFor(current);
   };
-  runtime.markHover = async (current, point) => {
-    const resolver = current?.markCdp;
-    if (!resolver || current.markHoverBusy) return;
-    const now = Date.now();
-    if (now - current.markHoverAt < 40) return;
-    current.markHoverAt = now;
-    current.markHoverBusy = true;
-    try {
-      const highlight = await resolver.hoverAt(point);
-      if (!current.markActive || current.markCdp !== resolver || current.markContextId === null) return;
-      if (highlight) {
-        await setMarkHighlight(pageOf(current), current.markContextId, highlight);
-      } else {
-        await clearMarkHighlight(pageOf(current), current.markContextId);
-      }
-    } catch {
-    } finally {
-      current.markHoverBusy = false;
-    }
-  };
   runtime.handleMarkInput = async (event, page) => {
     const current = activeTab();
     if (!current) return false;
@@ -8193,6 +8304,8 @@ var createBrowserRuntime = ({
       if (event.action === "down" && event.button === 0) {
         const contexts = current.markFrameContexts.slice();
         const resolver = current.markCdp;
+        const contextId2 = current.markContextId;
+        if (contextId2 !== null) void hideMarkOverlay(pageOf(current), contextId2);
         let payload = null;
         if (resolver) {
           payload = await resolver.describeAt({ x: event.x, y: event.y }).catch(() => null);
@@ -8207,10 +8320,6 @@ var createBrowserRuntime = ({
         await cancelMarkMode();
         current.markSwallowPointerUp = true;
         return true;
-      }
-      if (event.action === "move") {
-        void runtime.markHover(current, { x: event.x, y: event.y });
-        return false;
       }
       return true;
     }
@@ -8305,11 +8414,11 @@ var createBrowserRuntime = ({
     await refreshNavigation(current);
   };
   const execute = createBrowserActions(runtime);
-  const surface = createSurface(runtime);
+  const surfaceController = createSurface(runtime, surface);
   let copyRequest = null;
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
-    readSelection: () => surface.clipboard(),
+    readSelection: () => surfaceController.clipboard(),
     onAction: (action, selection) => {
       if (action === "back" || action === "forward" || action === "reload") {
         void runtime.command(action).catch(() => {
@@ -8354,11 +8463,11 @@ var createBrowserRuntime = ({
     actionQueue = operation;
     return operation;
   };
-  runtime.surfaceFrame = (request) => surface.frame(request);
-  runtime.surfaceInput = (events, theme) => surface.input(events, theme);
-  runtime.surfaceControl = (controller) => surface.control(controller);
-  runtime.surfaceResize = (size) => surface.resize(size);
-  runtime.surfaceClipboard = () => surface.clipboard();
+  runtime.surfaceFrame = (request) => surfaceController.frame(request);
+  runtime.surfaceInput = (events, theme) => surfaceController.input(events, theme);
+  runtime.surfaceControl = (controller) => surfaceController.control(controller);
+  runtime.surfaceResize = (size) => surfaceController.resize(size);
+  runtime.surfaceClipboard = () => surfaceController.clipboard();
   runtime.onDead = (listener) => {
     deathListeners.add(listener);
     return () => deathListeners.delete(listener);
@@ -8373,7 +8482,7 @@ var createBrowserRuntime = ({
     shutdownController.abort(new DOMException("Browser runtime stopped", "AbortError"));
     await chrome.close();
     cdp?.close();
-    await surface.close();
+    await surfaceController.close();
     inspector.close();
     await pagePromise?.catch(() => {
     });

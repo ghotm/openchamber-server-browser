@@ -142,7 +142,15 @@ function installMarkOverlay() {
   root.append(style, box, label);
   document.documentElement.append(host);
 
+  let lastPoint = null;
+  let hoverRaf = null;
+  let overFrame = false;
+  let stopped = false;
+
   const hide = () => {
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
     box.hidden = true;
     label.hidden = true;
   };
@@ -160,28 +168,117 @@ function installMarkOverlay() {
     label.style.top = `${top > 24 ? top - 22 : top + height + 4}px`;
   };
 
-  const onViewportChange = () => hide();
-  addEventListener('scroll', onViewportChange, true);
-  addEventListener('resize', onViewportChange, true);
+  const isFrame = (element) => element?.tagName === 'IFRAME' || element?.tagName === 'FRAME';
 
-  state.setHighlight = (highlight) => {
-    const rect = highlight?.rect;
-    if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)) {
+  const hitAt = (x, y) => {
+    let element = document.elementFromPoint(x, y);
+    for (let depth = 0; depth < 8 && element?.shadowRoot; depth += 1) {
+      const inner = element.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === element) break;
+      element = inner;
+    }
+    return element;
+  };
+
+  const labelFor = (element) => {
+    const tag = String(element.tagName ?? '').toLowerCase();
+    const id = element.id ? `#${element.id}` : '';
+    const className = element.getAttribute?.('class') ?? '';
+    const classes = String(className).trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    return `${tag}${id}${classes.map((name) => `.${name}`).join('')}`;
+  };
+
+  const drawAt = (point) => {
+    const element = hitAt(point.x, point.y);
+    if (!element || isFrame(element)) {
+      overFrame = true;
+      lastPoint = null;
       hide();
       return;
     }
-    place(rect.x, rect.y, rect.width, rect.height, String(highlight.label ?? 'element'));
+    const rect = element.getBoundingClientRect();
+    if (!(rect.width > 0 && rect.height > 0)) {
+      hide();
+      return;
+    }
+    place(rect.left, rect.top, rect.width, rect.height, labelFor(element));
   };
-  state.clearHighlight = hide;
+
+  const scheduleHover = () => {
+    if (stopped || hoverRaf !== null || overFrame || !lastPoint) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = null;
+      if (!stopped && lastPoint && !overFrame) drawAt(lastPoint);
+    });
+  };
+
+  const onPointerMove = (event) => {
+    if (stopped) return;
+    lastPoint = { x: event.clientX, y: event.clientY };
+    overFrame = false;
+    scheduleHover();
+  };
+  const onPointerOver = (event) => {
+    if (stopped || !isFrame(event.target)) return;
+    overFrame = true;
+    lastPoint = null;
+    hide();
+  };
+  const onPointerOut = (event) => {
+    if (stopped) return;
+    if (isFrame(event.target)) {
+      overFrame = false;
+      return;
+    }
+    // Entering a frame sends pointerout with the frame as the related target;
+    // no pointermove follows inside it in this window.
+    if (isFrame(event.relatedTarget)) {
+      overFrame = true;
+      lastPoint = null;
+      hide();
+    }
+  };
+  const onViewportChange = () => {
+    if (stopped) return;
+    if (lastPoint && !overFrame) scheduleHover();
+    else hide();
+  };
+
+  addEventListener('pointermove', onPointerMove, true);
+  addEventListener('pointerover', onPointerOver, true);
+  addEventListener('pointerout', onPointerOut, true);
+  addEventListener('scroll', onViewportChange, true);
+  addEventListener('resize', onViewportChange, true);
+
+  state.stop = () => {
+    stopped = true;
+    overFrame = true;
+    hide();
+  };
+  state.describe = () => ({
+    hidden: box.hidden,
+    label: label.textContent,
+    left: box.style.left,
+    top: box.style.top,
+    width: box.style.width,
+    height: box.style.height,
+  });
   state.cancel = () => {
+    removeEventListener('pointermove', onPointerMove, true);
+    removeEventListener('pointerover', onPointerOver, true);
+    removeEventListener('pointerout', onPointerOut, true);
     removeEventListener('scroll', onViewportChange, true);
     removeEventListener('resize', onViewportChange, true);
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
+    overFrame = false;
     host.remove();
     box.hidden = true;
     label.hidden = true;
     state.cancel = null;
-    state.setHighlight = null;
-    state.clearHighlight = null;
+    state.stop = null;
+    state.describe = null;
   };
   return { ok: true };
 }
@@ -204,12 +301,9 @@ export const installMark = async (page, contextId) => {
   await call(page, contextId, installMarkOverlay);
 };
 
-export const setMarkHighlight = async (page, contextId, highlight) => {
-  await call(page, contextId, callMarkOverlay, { method: 'setHighlight', argument: highlight });
-};
-
-export const clearMarkHighlight = async (page, contextId) => {
-  await call(page, contextId, callMarkOverlay, { method: 'clearHighlight' }).catch(() => {});
+export const hideMarkOverlay = async (page, contextId) => {
+  if (!Number.isInteger(contextId)) return;
+  await call(page, contextId, callMarkOverlay, { method: 'stop' }).catch(() => {});
 };
 
 export const cancelMark = async (page, contextId) => {
