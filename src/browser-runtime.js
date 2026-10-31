@@ -193,6 +193,11 @@ export const createBrowserRuntime = ({
       if (!copyRequest || Date.now() - copyRequest.at > 10_000) return null;
       return { id: copyRequest.id, text: copyRequest.text };
     },
+    // Text removed by a viewer's cut; the dock writes it to the host clipboard.
+    get cutRequest() {
+      if (!cutRequest || Date.now() - cutRequest.at > 10_000) return null;
+      return { id: cutRequest.id, text: cutRequest.text };
+    },
     get problemCounts() {
       const problems = activeTab()?.problems ?? [];
       return {
@@ -820,6 +825,7 @@ export const createBrowserRuntime = ({
   const surfaceController = createSurface(runtime, surface);
 
   let copyRequest = null;
+  let cutRequest = null;
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
     readSelection: () => surfaceController.clipboard(),
@@ -875,6 +881,13 @@ export const createBrowserRuntime = ({
   runtime.surfaceControl = (controller) => surfaceController.control(controller);
   runtime.surfaceResize = (size) => surfaceController.resize(size);
   runtime.surfaceClipboard = () => surfaceController.clipboard();
+  runtime.offerCutClipboard = (text) => {
+    cutRequest = { id: crypto.randomUUID(), text: text.slice(0, GUEST_CLIPBOARD_TEXT_MAX), at: Date.now() };
+    return cutRequest.id;
+  };
+  runtime.clearCutClipboard = (id) => {
+    if (cutRequest?.id === id) cutRequest = null;
+  };
   runtime.onDead = (listener) => {
     deathListeners.add(listener);
     return () => deathListeners.delete(listener);

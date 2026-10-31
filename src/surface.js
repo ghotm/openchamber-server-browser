@@ -1,12 +1,71 @@
-import { SURFACE_FRAME_MAX_BYTES, SURFACE_TEXT_MAX } from '@openchamber/sdk';
+import { GUEST_CLIPBOARD_TEXT_MAX, SURFACE_FRAME_MAX_BYTES, SURFACE_TEXT_MAX } from '@openchamber/sdk';
 import { DEFAULT_SURFACE } from './config.js';
 import { coalesceSurfaceEvents } from './input-events.js';
 
 const BUTTON_NAMES = ['left', 'middle', 'right'];
 const KEY_CODES = Object.freeze({
-  Backspace: 8, Tab: 9, Enter: 13, Escape: 27, PageUp: 33, PageDown: 34, End: 35, Home: 36,
-  ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Insert: 45, Delete: 46,
+  Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18, Pause: 19, CapsLock: 20,
+  Escape: 27, Space: 32, PageUp: 33, PageDown: 34, End: 35, Home: 36, ArrowLeft: 37,
+  ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, PrintScreen: 44, Insert: 45, Delete: 46,
+  Meta: 91, ContextMenu: 93, NumLock: 144, ScrollLock: 145,
 });
+// A printable key's virtual key code comes from the physical key, not from the
+// character Shift produced. `#` from Shift+3 is VK_3 (51), not VK_END (35).
+const CUT_CLIPBOARD_TTL_MS = 5000;
+const CODE_KEY_CODES = Object.freeze({
+  Space: 32, Backquote: 192, Minus: 189, Equal: 187, BracketLeft: 219, Backslash: 220,
+  BracketRight: 221, Semicolon: 186, Quote: 222, Comma: 188, Period: 190, Slash: 191,
+  IntlBackslash: 226, IntlRo: 226, IntlYen: 220,
+  NumpadAdd: 107, NumpadSubtract: 109, NumpadMultiply: 106, NumpadDivide: 111,
+  NumpadDecimal: 110, NumpadEqual: 187,
+  ControlLeft: 17, ControlRight: 17, ShiftLeft: 16, ShiftRight: 16,
+  AltLeft: 18, AltRight: 18, MetaLeft: 91, MetaRight: 92,
+  Pause: 19, CapsLock: 20, PrintScreen: 44, ScrollLock: 145, NumLock: 144, ContextMenu: 93,
+  BrowserBack: 166, BrowserForward: 167, BrowserRefresh: 168, BrowserStop: 169,
+  BrowserSearch: 170, BrowserFavorites: 171, BrowserHome: 172,
+  VolumeMute: 173, VolumeDown: 174, VolumeUp: 175,
+  AudioVolumeMute: 173, AudioVolumeDown: 174, AudioVolumeUp: 175,
+  MediaTrackNext: 176, MediaTrackPrevious: 177, MediaStop: 178, MediaPlayPause: 179,
+  LaunchMail: 180, MediaSelect: 181, LaunchApp1: 182, LaunchApp2: 183,
+});
+
+const CODE_TEXT = Object.freeze({
+  Backquote: '`', Minus: '-', Equal: '=', BracketLeft: '[', Backslash: '\\',
+  BracketRight: ']', Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/',
+  Space: ' ', IntlBackslash: '\\', IntlRo: '\\', IntlYen: '¥',
+});
+
+const virtualKeyCode = (key, code) => {
+  const named = KEY_CODES[key];
+  if (named !== undefined) return named;
+  const mapped = CODE_KEY_CODES[code];
+  if (mapped !== undefined) return mapped;
+  const functionKey = /^F([1-9]|1[0-9]|2[0-4])$/.exec(code);
+  if (functionKey) return 111 + Number(functionKey[1]);
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+  if (/^Numpad[0-9]$/.test(code)) return 96 + Number(code.slice(6));
+  return key.length === 1 && /[a-z0-9]/i.test(key) ? key.toUpperCase().charCodeAt(0) : 0;
+};
+
+const unmodifiedTextFor = (code) => {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return code.slice(6);
+  return CODE_TEXT[code] ?? null;
+};
+
+const keyLocation = (code) => {
+  if (code.startsWith('Numpad')) return 3;
+  if (/^(Control|Shift|Alt|Meta)Left$/.test(code)) return 1;
+  if (/^(Control|Shift|Alt|Meta)Right$/.test(code)) return 2;
+  return 0;
+};
+
+const isCutChord = (event) => event.type === 'key' && event.action === 'down'
+  && (event.modifiers.ctrl || event.modifiers.meta)
+  && !event.modifiers.alt && !event.modifiers.shift
+  && event.key.toLowerCase() === 'x';
 
 const modifiersMask = (modifiers) => (
   (modifiers.alt ? 1 : 0)
@@ -22,7 +81,7 @@ const heldButton = (buttons) => (buttons & 1 ? 'left' : buttons & 2 ? 'right' : 
 
 const baseCharacter = (key, code) => code === `Key${key.toUpperCase()}` || code === `Digit${key}`;
 
-const dispatchInput = async (page, event) => {
+const dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
   if (event.type === 'text') {
     await page.cdp.sendSession(page.sessionId, 'Input.insertText', { text: event.text });
     return;
@@ -52,7 +111,7 @@ const dispatchInput = async (page, event) => {
     return;
   }
   const { alt, ctrl, meta, shift } = event.modifiers;
-  const keyCode = KEY_CODES[event.key] ?? (event.key.length === 1 ? event.key.toUpperCase().charCodeAt(0) : 0);
+  const keyCode = virtualKeyCode(event.key, event.code);
   const single = [...event.key].length === 1;
   // Option (Mac) and AltGr (Ctrl+Alt on Windows) compose characters. Chords that
   // leave the key on its base character are shortcuts. Linux Chrome refuses to
@@ -63,6 +122,7 @@ const dispatchInput = async (page, event) => {
   const text = down && single && !meta && (composed || (!alt && !ctrl)) ? event.key
     : down && event.key === 'Enter' && !alt && !ctrl && !meta ? '\r' : null;
   const selectAll = down && event.key.toLowerCase() === 'a' && (ctrl || meta) && !alt && !shift;
+  const unmodifiedText = text ? unmodifiedTextFor(event.code) : null;
   await page.cdp.sendSession(page.sessionId, 'Input.dispatchKeyEvent', {
     type: down ? 'keyDown' : 'keyUp',
     key: event.key,
@@ -70,7 +130,10 @@ const dispatchInput = async (page, event) => {
     modifiers: modifiersMask(modifiers),
     windowsVirtualKeyCode: keyCode,
     nativeVirtualKeyCode: keyCode,
-    ...(text ? { text, unmodifiedText: text } : {}),
+    location: keyLocation(event.code),
+    isKeypad: event.code.startsWith('Numpad'),
+    autoRepeat,
+    ...(text ? { text, ...(unmodifiedText ? { unmodifiedText } : {}) } : {}),
     ...(selectAll ? { commands: ['selectAll'] } : {}),
   });
 };
@@ -108,6 +171,14 @@ const clipboardExpression = `(() => {
   return '';
 })()`;
 
+const readSelection = async (page) => {
+  const response = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression: clipboardExpression,
+    returnByValue: true,
+  });
+  return typeof response.result?.value === 'string' ? response.result.value : '';
+};
+
 const stopScreencast = (page) => {
   if (page?.cdp.isOpen) void page.cdp.sendSession(page.sessionId, 'Page.stopScreencast').catch(() => {});
 };
@@ -123,6 +194,18 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
   // Bumps whenever the runtime's active tab changes.
   let target = 0;
   let swallowEscapeUp = false;
+  // A cut removes the selection before the host asks what was copied, so keep
+  // the text read just before the cut until that request arrives.
+  let pendingCut = null;
+  // Host key events carry no repeat flag; track held keys to mark repeats.
+  const pressedKeys = new Set();
+  const clearPendingCut = () => {
+    pendingCut = null;
+  };
+  const clearCutRequest = () => {
+    const cut = runtime.cutRequest;
+    if (cut) runtime.clearCutClipboard?.(cut.id);
+  };
 
   const finishWaiter = (waiter, value) => {
     if (!waiters.delete(waiter)) return;
@@ -249,6 +332,7 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
         // Mark confirmation, the context menu, keys, and clicks must see the
         // page after every move that preceded them.
         await flushPendingMoves();
+        if (event.type === 'pointer' && event.action !== 'move') clearPendingCut();
         if (await runtime.handleMarkInput?.(event, current)) continue;
         if (event.type === 'key' && event.key === 'Escape' && event.action === 'up' && swallowEscapeUp) {
           swallowEscapeUp = false;
@@ -266,7 +350,20 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           }
         }
         if (secondary && event.action === 'down') await menu.observe(current).catch(() => {});
-        await dispatchInput(current, event);
+        if (event.type === 'key' && event.action === 'down' && !isCutChord(event)) clearPendingCut();
+        if (isCutChord(event)) {
+          const text = (await readSelection(current).catch(() => ''))
+            .slice(0, GUEST_CLIPBOARD_TEXT_MAX);
+          const cutId = text ? runtime.offerCutClipboard?.(text) ?? null : null;
+          pendingCut = { text, at: Date.now(), cutId };
+        }
+        const keyId = event.type === 'key' ? event.code || event.key : null;
+        const autoRepeat = keyId !== null && event.action === 'down' && pressedKeys.has(keyId);
+        if (keyId !== null) {
+          if (event.action === 'down') pressedKeys.add(keyId);
+          else pressedKeys.delete(keyId);
+        }
+        await dispatchInput(current, event, { autoRepeat });
         if (secondary && event.action === 'up') await menu.settle(current, theme).catch(() => {});
       }
       await flushPendingMoves();
@@ -275,24 +372,35 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       // The manager repeats the viewer's claim with every input batch; only a
       // change of hands closes the menu.
       if (runtime.controller !== controller) void runtime.contextMenu.close();
-      if (controller !== 'user') void runtime.cancelMark?.();
+      if (controller !== 'user') {
+        clearPendingCut();
+        pressedKeys.clear();
+        void runtime.cancelMark?.();
+      }
       runtime.controller = controller;
     },
     resize({ width, height }) {
       return runtime.setPanelSize({ width, height });
     },
     async clipboard() {
-      const current = await start();
-      const response = await current.cdp.sendSession(current.sessionId, 'Runtime.evaluate', {
-        expression: clipboardExpression,
-        returnByValue: true,
-      });
-      return typeof response.result?.value === 'string' ? response.result.value : '';
+      if (pendingCut && Date.now() - pendingCut.at <= CUT_CLIPBOARD_TTL_MS) {
+        const { text, cutId } = pendingCut;
+        pendingCut = null;
+        if (cutId) runtime.clearCutClipboard?.(cutId);
+        return text;
+      }
+      clearPendingCut();
+      const text = await readSelection(await start());
+      clearCutRequest();
+      return text;
     },
     // The active tab changed: stop streaming the old one and wake long polls so
     // the next request starts on the new tab.
     retarget() {
       target += 1;
+      clearPendingCut();
+      clearCutRequest();
+      pressedKeys.clear();
       detach();
       latest = null;
       for (const waiter of waiters) finishWaiter(waiter, null);
@@ -300,6 +408,9 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     async close() {
       if (closed) return;
       closed = true;
+      clearPendingCut();
+      clearCutRequest();
+      pressedKeys.clear();
       for (const waiter of waiters) finishWaiter(waiter, null);
       await startPromise?.catch(() => {});
       detach();

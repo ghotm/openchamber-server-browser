@@ -10,6 +10,15 @@ import { createChromeProcess, resolveChromePath } from '../src/chrome-process.js
 
 const modifiers = Object.freeze({ alt: false, ctrl: false, meta: false, shift: false });
 
+const lstatExists = (file) => {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const listen = (server) => new Promise((resolve, reject) => {
   server.once('error', reject);
   server.listen(0, '127.0.0.1', () => resolve(server.address().port));
@@ -367,6 +376,72 @@ test('presents itself as regular Chrome, which Google sign-in requires', { skip:
   assert.equal(await evaluate('navigator.webdriver'), false);
 });
 
+test('recovers a stale same-host Chrome lock in a persistent profile', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-lock-'));
+  context.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const profileDir = path.join(root, 'chat-profile');
+  const leaseDir = path.join(profileDir, '.openchamber-lease');
+  await fs.promises.mkdir(profileDir, { recursive: true });
+  await fs.promises.symlink(`${os.hostname()}-2147483647`, path.join(profileDir, 'SingletonLock'));
+  await fs.promises.symlink('123456', path.join(profileDir, 'SingletonCookie'));
+  await fs.promises.symlink('/tmp/openchamber-missing-socket', path.join(profileDir, 'SingletonSocket'));
+
+  const chrome = createChromeProcess({ chromePath, userDataDir: profileDir });
+  try {
+    const running = await chrome.ensure();
+    assert.equal(running.profileDir, profileDir);
+  } finally {
+    await chrome.close();
+  }
+  assert.equal(lstatExists(path.join(profileDir, 'SingletonLock')), false);
+  assert.equal(fs.existsSync(leaseDir), false);
+});
+
+test('refuses a foreign lock on first migration and releases its lease', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-migration-'));
+  context.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const profileDir = path.join(root, 'chat-profile');
+  await fs.promises.mkdir(profileDir, { recursive: true });
+  await fs.promises.symlink('old-container-123', path.join(profileDir, 'SingletonLock'));
+
+  const chrome = createChromeProcess({ chromePath, userDataDir: profileDir });
+  try {
+    await assert.rejects(chrome.ensure(), /no prior lease/i);
+    assert.equal(lstatExists(path.join(profileDir, 'SingletonLock')), true);
+    assert.equal(fs.existsSync(path.join(profileDir, '.openchamber-lease')), false);
+  } finally {
+    await chrome.close();
+  }
+});
+
+test('retries Chrome startup after a failed launch', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-retry-'));
+  context.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const marker = path.join(root, 'failed-once');
+  const wrapper = path.join(root, 'chrome-wrapper.sh');
+  await fs.promises.writeFile(wrapper, `#!/bin/sh
+case " $* " in
+  *" --remote-debugging-port=0 "*)
+    if [ ! -f "${marker}" ]; then
+      : > "${marker}"
+      echo "fake startup failure" >&2
+      exit 21
+    fi
+    ;;
+esac
+exec "${chromePath}" "$@"
+`, { mode: 0o755 });
+  const profileDir = path.join(root, 'chat-profile');
+  const chrome = createChromeProcess({ chromePath: wrapper, userDataDir: profileDir, startupTimeoutMs: 5_000 });
+  try {
+    await assert.rejects(chrome.ensure(), /code 21[\s\S]*fake startup failure/);
+    const running = await chrome.ensure();
+    assert.equal(running.profileDir, profileDir);
+  } finally {
+    await chrome.close();
+  }
+});
+
 test('stops Chrome at once on close even when its page no longer answers', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
   // Given a page stuck in an endless loop, with native select styles that a graceful close would try to undo there.
   const web = await startWebFixture();
@@ -514,9 +589,16 @@ test('types editing keys, Enter, select-all, and composed characters like a loca
   await press('@', 'Digit2', { alt: true });
   await press('c', 'KeyC', { ctrl: true });
   await press('d', 'KeyD', { alt: true });
+  await press('#', 'Digit3', { shift: true });
+  await press('$', 'Digit4', { shift: true });
+  await press('%', 'Digit5', { shift: true });
+  await press('^', 'Digit6', { shift: true });
+  await press('&', 'Digit7', { shift: true });
+  await press('(', 'Digit9', { shift: true });
 
-  // Then Enter adds a line, composed characters are typed, and shortcuts type nothing.
-  assert.equal(await evaluate('document.querySelector("#notes").value'), 'a\nb@@');
+  // Then Enter adds a line, composed characters and shifted symbols are typed,
+  // and shortcuts type nothing.
+  assert.equal(await evaluate('document.querySelector("#notes").value'), 'a\nb@@#$%^&(');
 
   // When the caret moves with End and Home, and Meta+A selects the field.
   await evaluate('document.querySelector("#field").focus(); document.querySelector("#field").setSelectionRange(5, 5)');
@@ -536,6 +618,74 @@ test('types editing keys, Enter, select-all, and composed characters like a loca
   assert.equal(await evaluate('document.querySelector("#submits").textContent'), '1');
 });
 
+test('does not reuse a cut after the pointer moves to another selection', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page whose text was cut, then another selection made with the pointer.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/keys` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  })).result.value;
+  await evaluate('(() => { const notes = document.querySelector("#notes"); notes.value = "cut this"; notes.focus(); notes.setSelectionRange(0, 3); })()');
+  await runtime.surfaceInput(['down', 'up'].map((action) => ({
+    type: 'key', action, key: 'x', code: 'KeyX', modifiers: { ...modifiers, ctrl: true },
+  })));
+  await runtime.surfaceInput([
+    { type: 'pointer', action: 'down', x: 1, y: 1, button: 0, buttons: 1, modifiers },
+    { type: 'pointer', action: 'up', x: 1, y: 1, button: 0, buttons: 0, modifiers },
+  ]);
+  await evaluate('(() => { const notes = document.querySelector("#notes"); notes.value = "other"; notes.focus(); notes.setSelectionRange(0, 5); })()');
+
+  // Then a later clipboard read returns the new selection, never the old cut.
+  assert.equal(await runtime.surfaceClipboard(), 'other');
+});
+
+test('sends function-key codes, keypad location, and held-key repeat', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page that records the raw keyboard fields the page receives.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/keys` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  })).result.value;
+  await evaluate(`window.keyLog = [];
+    document.addEventListener('keydown', (event) => window.keyLog.push({
+      key: event.key, code: event.code, keyCode: event.keyCode,
+      location: event.location, repeat: event.repeat,
+    }), true)`);
+  const press = (key, code, pressed = {}) => runtime.surfaceInput(['down', 'up'].map((action) => ({
+    type: 'key', action, key, code, modifiers: { ...modifiers, ...pressed },
+  })));
+
+  // When the viewer presses function keys, a keypad key, and holds Shift.
+  await press('F1', 'F1');
+  await press('F2', 'F2');
+  await press('F9', 'F9');
+  await press('1', 'Numpad1');
+  await runtime.surfaceInput([1, 2].map(() => ({
+    type: 'key', action: 'down', key: 'Shift', code: 'ShiftLeft', modifiers: { ...modifiers, shift: true },
+  })));
+  await runtime.surfaceInput([{ type: 'key', action: 'up', key: 'Shift', code: 'ShiftLeft', modifiers: modifiers }]);
+
+  // Then VK codes, keypad location, and repeat reach the page.
+  const log = JSON.parse(await evaluate('JSON.stringify(window.keyLog)'));
+  assert.deepEqual(log.slice(0, 4).map(({ key, keyCode }) => [key, keyCode]), [
+    ['F1', 112], ['F2', 113], ['F9', 120], ['1', 97],
+  ]);
+  assert.equal(log[3].location, 3);
+  assert.equal(log[4].location, 1);
+  assert.equal(log[4].repeat, false);
+  assert.equal(log[5].repeat, true);
+});
+
 test('copies the focused selection through shadow roots and same-origin frames but never a password', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
   // Given a page with a password field, an open shadow root, and a same-origin frame.
   const web = await startWebFixture();
@@ -553,6 +703,35 @@ test('copies the focused selection through shadow roots and same-origin frames b
   assert.equal(await runtime.surfaceClipboard(), 'frame');
   await select('const p = document.querySelector("#secret"); p.focus(); p.select()');
   assert.equal(await runtime.surfaceClipboard(), '');
+});
+
+test('cuts the selection and keeps its text for the host clipboard', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a focused textarea with a selection.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/keys` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  })).result.value;
+  await evaluate('const notes = document.querySelector("#notes"); notes.value = "cut this"; notes.focus(); notes.setSelectionRange(0, 3)');
+
+  // When the viewer cuts, the page removes the selection and the host can still
+  // read what was cut, even though the selection is gone by then.
+  await runtime.surfaceInput(['down', 'up'].map((action) => ({
+    type: 'key', action, key: 'x', code: 'KeyX', modifiers: { ...modifiers, ctrl: true },
+  })));
+
+  // Then the cut reached the page and the copied text survived for the host,
+  // and consuming it also cleared the dock's pending clipboard request.
+  assert.equal(await evaluate('document.querySelector("#notes").value'), ' this');
+  const cut = runtime.cutRequest;
+  assert.equal(cut.text, 'cut');
+  assert.equal(await runtime.surfaceClipboard(), 'cut');
+  assert.equal(runtime.cutRequest, null);
 });
 
 test('drags across page text to select it like a held mouse button', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
@@ -1137,25 +1316,23 @@ test('closes this chat\'s tabs without creating one', { skip: chromePath ? false
   context.after(() => close(web.server));
   const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
   context.after(() => runtime.close());
-  await assert.rejects(runtime.perform('browser.close', {}), /no browser tab to close/);
+  await assert.rejects(runtime.perform('browser.close', {}), /no tab of its own/);
 
-  // When the chat opens two tabs, then close without an id closes the tab the viewer sees.
+  // When the chat opens two tabs, then close without an id closes the agent's newest tab.
   const first = await runtime.perform('browser.open', { url: `${web.origin}/` });
   const second = await runtime.perform('browser.open', { url: `${web.origin}/next` });
   assert.equal(runtime.tabs.length, 2);
-  assert.equal(runtime.tabs.find((tab) => tab.active).id, first.tabId);
-  assert.deepEqual(await runtime.perform('browser.close', {}), { closed: true, tabId: first.tabId });
-  assert.deepEqual(runtime.tabs.map((tab) => tab.id), [second.tabId]);
-  assert.equal(runtime.tabs[0].active, true);
+  assert.deepEqual(await runtime.perform('browser.close', {}), { closed: true, tabId: second.tabId });
+  assert.deepEqual(runtime.tabs.map((tab) => tab.id), [first.tabId]);
 
   // But an id from another browser is refused, and never replaced by a new tab.
   await assert.rejects(runtime.perform('browser.close', { tabId: 'missing' }), /no tab "missing"/);
   assert.equal(runtime.tabs.length, 1);
 
   // When the last tab closes, then the browser still accepts the next open.
-  assert.deepEqual(await runtime.perform('browser.close', { tabId: second.tabId }), { closed: true, tabId: second.tabId });
+  assert.deepEqual(await runtime.perform('browser.close', { tabId: first.tabId }), { closed: true, tabId: first.tabId });
   assert.equal(runtime.tabs.length, 0);
-  await assert.rejects(runtime.perform('browser.close', {}), /no browser tab to close/);
+  await assert.rejects(runtime.perform('browser.close', {}), /no tab of its own/);
   const reopened = await runtime.perform('browser.open', { url: `${web.origin}/title` });
   assert.equal(reopened.title, 'Title before');
 });

@@ -3640,7 +3640,7 @@ var require_websocket_server = __commonJS({
 });
 
 // src/main.js
-import path3 from "node:path";
+import path5 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/inspector.js
@@ -4366,6 +4366,11 @@ var createBrowserManager = ({
     }
     if (shownEarlierView(frameSeq)) throw new Error("The browser view changed before the dock command ran");
   };
+  const requireUserControl = ({ viewer = null } = {}) => {
+    if (controller !== "user" || viewer === null || viewer !== controllingViewer) {
+      throw new Error("Take control of the page before marking elements");
+    }
+  };
   const requireGeneration = (expectedGeneration) => {
     if (expectedGeneration !== viewGeneration) {
       throw new Error("The browser view changed before the dock command ran");
@@ -4421,6 +4426,8 @@ var createBrowserManager = ({
         generation: viewGeneration,
         notice: notice ? { ...notice } : null,
         copy: selected()?.runtime.copyRequest ?? null,
+        cut: selected()?.runtime.cutRequest ?? null,
+        mark: selected()?.runtime.markState ?? { active: false, ready: false, session: null, error: null, marks: [] },
         // The visible tab's errors and warnings, only for a dock whose console is open.
         ...problems ? { consoleProblems: selected()?.runtime.consoleProblems?.() ?? [] } : {},
         scopes: Array.from(scopes.values(), (entry) => ({
@@ -4494,6 +4501,58 @@ var createBrowserManager = ({
     },
     closeTab(tabId, expectedGeneration, access) {
       return dockCommand("tab-close", { tabId }, expectedGeneration, access);
+    },
+    startMark(session, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        requireUserControl(access);
+        const entry = requireSelected();
+        touch(entry);
+        await entry.runtime.startMark(session);
+      });
+    },
+    cancelMark(session, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        if (session && entry.runtime.markState.session !== session) return;
+        touch(entry);
+        await entry.runtime.cancelMark();
+      });
+    },
+    deleteMark(id, expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        touch(entry);
+        entry.runtime.deleteMark(id);
+      });
+    },
+    clearMarks(expectedGeneration, access) {
+      return enqueue(async () => {
+        requireDockAccess(access);
+        requireGeneration(expectedGeneration);
+        const entry = requireSelected();
+        touch(entry);
+        await entry.runtime.clearMarks();
+      });
+    },
+    resolveMarks() {
+      return enqueue(async () => {
+        const entry = requireSelected();
+        touch(entry);
+        return entry.runtime.resolveMarks();
+      });
+    },
+    ackCut(id) {
+      return enqueue(async () => {
+        const entry = requireSelected();
+        touch(entry);
+        entry.runtime.clearCutClipboard(id);
+      });
     },
     setViewport({ mode, width, height, mobile }, expectedGeneration, access) {
       return enqueue(async () => {
@@ -4659,15 +4718,15 @@ var createBrowserManager = ({
 };
 
 // src/browser-runtime.js
-import crypto3 from "node:crypto";
+import crypto5 from "node:crypto";
+import path4 from "node:path";
 
 // node_modules/@openchamber/sdk/dist/scrollbar-style.js
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
 var GUEST_SCROLLBAR_CSS = `
 :root {
-  /* Quiet at rest like the app's own thumbs; hover gives a clear grab target. */
-  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 18%, transparent);
-  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 36%, transparent);
+  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 40%, transparent);
+  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 65%, transparent);
   scrollbar-gutter: stable;
 }
 * {
@@ -4724,7 +4783,6 @@ var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(docu
 // node_modules/@openchamber/sdk/dist/contract.js
 var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
 var GUEST_CLIPBOARD_TEXT_MAX = 32e3;
-var GUEST_GENERATE_LATE_KEEP_MS = 60 * 6e4;
 var HOST_REQUEST_ERROR_CODES = [
   "HOST_UNAVAILABLE",
   "HOST_TIMEOUT",
@@ -4735,8 +4793,6 @@ var HOST_REQUEST_ERROR_CODES = [
   "NO_INTEGRATION",
   "NO_SERVICE",
   "SERVICE_FAILED",
-  "REQUEST_FAILED",
-  "RESPONSE_TOO_LARGE",
   "NO_SESSION",
   "SESSION_BUSY",
   "NOT_GRANTED",
@@ -4760,14 +4816,12 @@ var BROWSER_CONTROL_ACTIONS = [
   "browser.snapshot",
   "browser.click",
   "browser.type",
-  "browser.select",
   "browser.scroll",
   "browser.back",
   "browser.forward",
   "browser.inspect",
   "browser.capture",
-  "browser.resize",
-  "browser.close"
+  "browser.resize"
 ];
 var BROWSER_PROVIDER_OPEN_TIMEOUT_MS = 45e3;
 var BROWSER_PROVIDER_ACTION_TIMEOUT_MS = 2e4;
@@ -4801,7 +4855,6 @@ var readBrowserProviderRequest = (body) => {
     return null;
   return { requestId, action, parameters, context: readContext(context) };
 };
-var SOURCE_CONTROL_PROVIDER_IDLE_MS = 10 * 6e4;
 
 // node_modules/@openchamber/sdk/dist/service-surface.js
 var SURFACE_FRAME_PATH = "/surface/frame";
@@ -5025,6 +5078,21 @@ var HELPERS = `
       if (!partial && text.indexOf(wanted) !== -1) partial = element;
     }
     return partial;
+  };
+  var selectOptionLabel = function (option) {
+    var explicit = option.getAttribute('label');
+    if (explicit !== null) return explicit;
+    return String(option.textContent || '').replace(/\\s+/g, ' ').trim();
+  };
+  var isOptionDisabled = function (element) {
+    if (element.disabled === true) return true;
+    if (typeof element.matches === 'function' && element.matches(':disabled')) return true;
+    var parent = element.parentElement;
+    while (parent) {
+      if (parent.tagName === 'OPTGROUP' && parent.disabled === true) return true;
+      parent = parent.parentElement;
+    }
+    return false;
   };
 `;
 var wrapPageScript = (body) => `(() => {
@@ -5427,8 +5495,10 @@ var createBrowserActions = (runtime) => async (action, parameters, signal) => {
   if (action === "browser.snapshot") {
     const data = await runPageScript(page, buildSnapshotScript(parameters), signal);
     const problems = runtime.consoleProblems(page.targetId);
+    const marks = await runtime.snapshotMarks(page);
     return {
       ...data,
+      ...marks.length > 0 ? { marks } : {},
       viewport: viewportSummary(runtime.viewport),
       ...problems.length > 0 ? { consoleProblems: problems } : {},
       tabs: runtime.tabs.map(({ id, title, url, active }) => ({ id, title, url, active }))
@@ -5618,10 +5688,358 @@ var connectCdp = async (webSocketDebuggerUrl, {
 
 // src/chrome-process.js
 import { execFile, spawn } from "node:child_process";
+import fs2 from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
+import { promisify } from "node:util";
+
+// src/profile-lock.js
+import crypto2 from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+var LEASE_DIRECTORY = ".openchamber-lease";
+var OWNER_FILE = "owner.json";
+var CHROME_LOCK_FILES = Object.freeze(["SingletonLock", "SingletonCookie", "SingletonSocket"]);
+var LEASE_ATTEMPTS = 3;
+var LEASE_RETRY_MS = 200;
+var LEASE_HEARTBEAT_MS = 1e4;
+var LEASE_STALE_MS = 45e3;
+var delay = (milliseconds) => new Promise((resolve) => {
+  const timer = setTimeout(resolve, milliseconds);
+  timer.unref?.();
+});
+var leasePath = (profileDir) => path.join(profileDir, LEASE_DIRECTORY);
+var describedError = (message, cause) => {
+  const code = cause?.code ? ` (${cause.code})` : "";
+  const error = new Error(`${message}: ${cause?.message ?? String(cause)}${code}`);
+  error.cause = cause;
+  return error;
+};
+var parseSingletonTarget = (target) => {
+  const match = /^(.+)-(\d+)$/.exec(String(target ?? ""));
+  if (!match) return null;
+  const pid = Number.parseInt(match[2], 10);
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  return { hostname: match[1], pid };
+};
+var isProcessAlive = (pid) => {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+};
+var readLink = async (file, dependencies) => {
+  try {
+    return await dependencies.readlink(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw describedError(`Cannot read ${file}`, error);
+  }
+};
+var lockMessage = (profileDir, state, owner, reason) => {
+  if (state === "active") {
+    return `Chrome profile is already in use by ${owner.hostname} PID ${owner.pid}. Close that browser before starting another one for this chat.`;
+  }
+  if (state === "foreign") {
+    return `Chrome profile ${profileDir} has a lock from host ${owner.hostname} PID ${owner.pid}, and this installation has no prior lease. Stop the old service and remove SingletonLock, SingletonCookie, SingletonSocket and ${LEASE_DIRECTORY} once before upgrading.`;
+  }
+  return `Chrome profile ${profileDir} has an unreadable ${reason ?? "SingletonLock"}. Confirm no Chrome is using it, then remove SingletonLock, SingletonCookie and SingletonSocket.`;
+};
+var inspectChromeLock = async (profileDir, {
+  platform = process.platform,
+  hostname = os.hostname(),
+  pidAlive = isProcessAlive,
+  readlink = fs.promises.readlink,
+  lstat = fs.promises.lstat,
+  allowForeign = false
+} = {}) => {
+  if (platform === "win32") return { state: "missing" };
+  const lock = path.join(profileDir, "SingletonLock");
+  let info;
+  try {
+    info = await lstat(lock);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { state: "missing" };
+    throw describedError(`Cannot inspect ${lock}`, error);
+  }
+  if (!info.isSymbolicLink()) {
+    return { state: "unrecognized", reason: "SingletonLock is not a symlink" };
+  }
+  const target = await readLink(lock, { readlink });
+  const owner = parseSingletonTarget(target);
+  if (!owner) {
+    return { state: "unrecognized", reason: `SingletonLock target ${JSON.stringify(target)} is not <hostname>-<pid>` };
+  }
+  if (owner.hostname === hostname) {
+    return pidAlive(owner.pid) ? { state: "active", owner, message: lockMessage(profileDir, "active", owner) } : { state: "stale", owner, reason: "the owning process is gone" };
+  }
+  if (!allowForeign) {
+    return { state: "foreign", owner, message: lockMessage(profileDir, "foreign", owner) };
+  }
+  return { state: "stale", owner, reason: "the previous lease was stale" };
+};
+var clearChromeLock = async (profileDir, {
+  lstat = fs.promises.lstat,
+  rm = fs.promises.rm
+} = {}) => {
+  for (const name of CHROME_LOCK_FILES) {
+    const file = path.join(profileDir, name);
+    let info;
+    try {
+      info = await lstat(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw describedError(`Cannot inspect ${file}`, error);
+    }
+    if (name === "SingletonLock" && !info.isSymbolicLink()) {
+      throw new Error(`${file} is not a symlink. Confirm no Chrome is using this profile before removing it.`);
+    }
+    await rm(file, { force: true }).catch((error) => {
+      throw describedError(`Cannot remove ${file}`, error);
+    });
+  }
+};
+var readLeaseOwner = async (leaseDir, {
+  readFile = fs.promises.readFile
+} = {}) => {
+  const file = path.join(leaseDir, OWNER_FILE);
+  let raw;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { state: "missing" };
+    if (error?.code === "EACCES" || error?.code === "EPERM" || error?.code === "ENOTDIR") {
+      throw new Error(`Cannot read the profile lease at ${leaseDir} (${error.code}). Fix its permissions or remove the directory before retrying.`);
+    }
+    throw describedError(`Cannot read the profile lease at ${leaseDir}`, error);
+  }
+  try {
+    const owner = JSON.parse(raw);
+    if (!owner || typeof owner !== "object" || !Number.isFinite(owner.updatedAt)) {
+      return { state: "invalid" };
+    }
+    return { state: "owner", owner };
+  } catch {
+    return { state: "invalid" };
+  }
+};
+var writeOwnerAtomic = async (leaseDir, owner, {
+  writeFile = fs.promises.writeFile,
+  rename = fs.promises.rename,
+  rm = fs.promises.rm,
+  randomSuffix = () => crypto2.randomBytes(6).toString("hex")
+} = {}) => {
+  const temporary = path.join(leaseDir, `.owner.tmp-${randomSuffix()}`);
+  try {
+    await writeFile(temporary, JSON.stringify(owner), { mode: 384 });
+    await rename(temporary, path.join(leaseDir, OWNER_FILE));
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {
+    });
+    throw error;
+  }
+};
+var removeLease = async (leaseDir, { rm = fs.promises.rm } = {}) => {
+  await rm(leaseDir, { recursive: true, force: true });
+};
+var createLease = async (leaseDir, profileDir, {
+  hostname,
+  pid,
+  heartbeatMs,
+  now,
+  writeFile,
+  rename,
+  rm,
+  randomSuffix,
+  onLost
+}) => {
+  const startedAt = now();
+  const base = { version: 1, hostname, pid, profileDir, startedAt };
+  let current = { ...base, updatedAt: startedAt };
+  let released = false;
+  let lost = false;
+  let heartbeat = Promise.resolve();
+  const write = async () => {
+    current = { ...base, updatedAt: now() };
+    await writeOwnerAtomic(leaseDir, current, { writeFile, rename, rm, randomSuffix });
+  };
+  const reportLost = (error) => {
+    if (lost || released) return;
+    lost = true;
+    queueMicrotask(() => {
+      Promise.resolve(onLost?.(error)).catch(() => {
+      });
+    });
+  };
+  try {
+    await write();
+  } catch (error) {
+    await removeLease(leaseDir, { rm }).catch(() => {
+    });
+    throw describedError(`Cannot create the profile lease at ${leaseDir}`, error);
+  }
+  const timer = setInterval(() => {
+    if (released || lost) return;
+    heartbeat = heartbeat.then(async () => {
+      if (released || lost) return;
+      try {
+        await write();
+      } catch (error) {
+        reportLost(error);
+      }
+    });
+  }, heartbeatMs);
+  timer.unref?.();
+  let releasePromise = null;
+  return {
+    owner: current,
+    leaseDir,
+    release() {
+      if (released) return Promise.resolve();
+      if (!releasePromise) {
+        clearInterval(timer);
+        releasePromise = (async () => {
+          await heartbeat.catch(() => {
+          });
+          try {
+            await removeLease(leaseDir, { rm });
+            released = true;
+          } catch (error) {
+            releasePromise = null;
+            throw describedError(`Cannot remove the profile lease at ${leaseDir}`, error);
+          }
+        })();
+      }
+      return releasePromise;
+    }
+  };
+};
+var profileLeaseExists = async (profileDir, {
+  lstat = fs.promises.lstat
+} = {}) => {
+  const leaseDir = leasePath(profileDir);
+  try {
+    const info = await lstat(leaseDir);
+    if (!info.isDirectory()) throw new Error(`${leaseDir} is not a directory`);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    if (error?.code === "EACCES" || error?.code === "EPERM" || error?.code === "ENOTDIR") {
+      throw new Error(`Cannot read the profile lease at ${leaseDir} (${error.code}). Fix its permissions or remove the directory before retrying.`);
+    }
+    if (error?.message?.includes("is not a directory")) throw error;
+    throw describedError(`Cannot read the profile lease at ${leaseDir}`, error);
+  }
+};
+var acquireProfileLease = async (profileDir, {
+  hostname = os.hostname(),
+  pid = process.pid,
+  heartbeatMs = LEASE_HEARTBEAT_MS,
+  staleMs = LEASE_STALE_MS,
+  now = Date.now,
+  mkdir = fs.promises.mkdir,
+  readFile = fs.promises.readFile,
+  writeFile = fs.promises.writeFile,
+  rename = fs.promises.rename,
+  rm = fs.promises.rm,
+  lstat = fs.promises.lstat,
+  randomSuffix = () => crypto2.randomBytes(6).toString("hex"),
+  onLost = null
+} = {}) => {
+  const leaseDir = leasePath(profileDir);
+  for (let attempt = 0; attempt < LEASE_ATTEMPTS; attempt += 1) {
+    try {
+      await mkdir(leaseDir, { mode: 448 });
+      return await createLease(leaseDir, profileDir, {
+        hostname,
+        pid,
+        heartbeatMs,
+        now,
+        writeFile,
+        rename,
+        rm,
+        randomSuffix,
+        onLost
+      });
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw describedError(`Cannot create the profile lease at ${leaseDir}`, error);
+      }
+    }
+    const ownerState = await readLeaseOwner(leaseDir, { readFile });
+    let leaseInfo;
+    try {
+      leaseInfo = await lstat(leaseDir);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      if (error?.code === "EACCES" || error?.code === "EPERM" || error?.code === "ENOTDIR") {
+        throw new Error(`Cannot read the profile lease at ${leaseDir} (${error.code}). Fix its permissions or remove the directory before retrying.`);
+      }
+      throw describedError(`Cannot read the profile lease at ${leaseDir}`, error);
+    }
+    if (!leaseInfo.isDirectory()) {
+      throw new Error(`${leaseDir} is not a directory. Confirm no process is using this profile before removing it.`);
+    }
+    if (ownerState.state === "owner") {
+      const age = now() - ownerState.owner.updatedAt;
+      if (age <= staleMs) {
+        throw new Error(`Profile ${profileDir} is leased by host ${ownerState.owner.hostname} PID ${ownerState.owner.pid} (heartbeat ${Math.max(0, Math.round(age / 1e3))}s ago). Wait for it to stop, or stop that service first.`);
+      }
+    } else {
+      const age = now() - leaseInfo.mtimeMs;
+      if (age <= staleMs) {
+        if (attempt < LEASE_ATTEMPTS - 1) {
+          await delay(LEASE_RETRY_MS);
+          continue;
+        }
+        throw new Error(`Cannot read the profile lease at ${leaseDir}. It is too new to take over. Remove it only after confirming no Chrome is using this profile.`);
+      }
+    }
+    try {
+      await removeLease(leaseDir, { rm });
+    } catch (error) {
+      throw describedError(`Cannot remove the stale profile lease at ${leaseDir}`, error);
+    }
+  }
+  throw new Error(`Cannot acquire the profile lease at ${leaseDir} after ${LEASE_ATTEMPTS} attempts`);
+};
+var recoverProfile = async (profileDir, options = {}) => {
+  const hadPriorLease = await profileLeaseExists(profileDir, options);
+  let lease = null;
+  try {
+    lease = await acquireProfileLease(profileDir, options);
+    const lock = await inspectChromeLock(profileDir, {
+      ...options,
+      allowForeign: hadPriorLease
+    });
+    if (lock.state === "missing") return lease;
+    if (lock.state === "stale") {
+      await clearChromeLock(profileDir, options);
+      return lease;
+    }
+    const error = new Error(lock.message ?? lockMessage(profileDir, lock.state, lock.owner, lock.reason));
+    error.code = "PROFILE_LOCK";
+    throw error;
+  } catch (error) {
+    if (!lease) throw error;
+    const current = lease;
+    lease = null;
+    try {
+      await current.release();
+    } catch (releaseError) {
+      const combined = describedError(error.message, releaseError);
+      combined.code = error.code;
+      throw combined;
+    }
+    throw error;
+  }
+};
+
+// src/chrome-process.js
 var MINIMUM_CHROME_MAJOR_VERSION = 109;
 var SYSTEM_NAMES = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"];
 var USER_AGENT_PLATFORMS = Object.freeze({
@@ -5633,7 +6051,7 @@ var VERSION_RESOURCE_KEY = Buffer.from("VS_VERSION_INFO\0", "utf16le");
 var FIXED_FILE_INFO_SIGNATURE = 4277077181;
 var executable = (candidate) => {
   try {
-    fs.accessSync(candidate, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+    fs2.accessSync(candidate, process.platform === "win32" ? fs2.constants.F_OK : fs2.constants.X_OK);
     return true;
   } catch {
     return false;
@@ -5645,10 +6063,10 @@ var systemCandidates = () => {
   }
   if (process.platform === "win32") {
     const roots = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter(Boolean);
-    return roots.map((root) => path.join(root, "Google", "Chrome", "Application", "chrome.exe"));
+    return roots.map((root) => path2.join(root, "Google", "Chrome", "Application", "chrome.exe"));
   }
-  const entries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  return [...entries, "/usr/bin", "/usr/sbin", "/usr/local/bin", "/snap/bin"].flatMap((entry) => SYSTEM_NAMES.map((name) => path.join(entry, name)));
+  const entries = String(process.env.PATH || "").split(path2.delimiter).filter(Boolean);
+  return [...entries, "/usr/bin", "/usr/sbin", "/usr/local/bin", "/snap/bin"].flatMap((entry) => SYSTEM_NAMES.map((name) => path2.join(entry, name)));
 };
 var resolveChromePath = (configuredPath) => {
   if (configuredPath) {
@@ -5677,7 +6095,7 @@ var windowsChromeMajor = (image) => {
   return null;
 };
 var chromeMajorVersion = async (binary) => {
-  if (process.platform === "win32") return windowsChromeMajor(await fs.promises.readFile(binary));
+  if (process.platform === "win32") return windowsChromeMajor(await fs2.promises.readFile(binary));
   const { stdout } = await promisify(execFile)(binary, ["--version"], { timeout: 5e3 });
   return Number.parseInt(stdout.match(/(\d+)\.\d+\.\d+\.\d+/)?.[1] ?? "", 10);
 };
@@ -5707,18 +6125,28 @@ var probeVersion = async (endpoint) => {
     cdp.close();
   }
 };
-var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) => {
+var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3, userDataDir = null } = {}) => {
   let launchPromise = null;
   let child = null;
   let profileDir = null;
+  let persistentProfile = false;
   let result = null;
   let closed = false;
+  let lease = null;
+  let stderrHead = "";
+  let stderrTail = "";
   const exitListeners = /* @__PURE__ */ new Set();
+  const stderrSummary = () => {
+    const combined = stderrHead && stderrTail && !stderrHead.includes(stderrTail) ? `${stderrHead}
+${stderrTail}` : stderrHead || stderrTail;
+    const sanitized = combined.replace(/https?:\/\/\S+/gi, "<url>").replace(/\b(token|key|password|secret)\s*=\s*[^\s&]+/gi, "$1=<redacted>").replace(/\s+/g, " ").trim();
+    return sanitized.slice(0, 4096);
+  };
   const removeProfile = async () => {
-    if (!profileDir) return;
+    if (!profileDir || persistentProfile) return;
     const directory = profileDir;
     profileDir = null;
-    await fs.promises.rm(directory, { recursive: true, force: true });
+    await fs2.promises.rm(directory, { recursive: true, force: true });
   };
   const killChild = () => {
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
@@ -5733,16 +6161,57 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
     } catch {
     }
   };
+  const handleLeaseLost = (error) => {
+    if (closed) return;
+    const current = lease;
+    lease = null;
+    result = null;
+    killChild();
+    for (const listener of exitListeners) listener({ code: null, signal: "lease-lost", error });
+    if (current) void current.release().catch(() => {
+    });
+  };
   const waitForExit = (processToWait) => {
     if (!processToWait || processToWait.exitCode !== null || processToWait.signalCode !== null) return Promise.resolve();
     return new Promise((resolve) => processToWait.once("exit", resolve));
   };
+  const exitedWithin = async (processToWait, timeoutMs) => {
+    if (!processToWait || processToWait.exitCode !== null || processToWait.signalCode !== null) return true;
+    return Promise.race([
+      waitForExit(processToWait).then(() => true),
+      wait(timeoutMs).then(() => false)
+    ]);
+  };
+  const requestGracefulClose = async (endpoint) => {
+    try {
+      const cdp = await connectCdp(endpoint, { commandTimeoutMs: 1e3, handshakeTimeoutMs: 1e3 });
+      try {
+        await cdp.send("Browser.close");
+      } finally {
+        cdp.close();
+      }
+    } catch {
+    }
+  };
   const launch = async () => {
     const binary = resolveChromePath(chromePath);
-    profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "openchamber-server-browser-"));
-    await fs.promises.chmod(profileDir, 448);
+    if (userDataDir) {
+      profileDir = userDataDir;
+      persistentProfile = true;
+      await fs2.promises.mkdir(profileDir, { recursive: true, mode: 448 });
+      await fs2.promises.chmod(profileDir, 448);
+      lease = await recoverProfile(profileDir, {
+        onLost: (error) => handleLeaseLost(error)
+      });
+      await fs2.promises.rm(path2.join(profileDir, "DevToolsActivePort"), { force: true });
+    } else {
+      profileDir = await fs2.promises.mkdtemp(path2.join(os2.tmpdir(), "openchamber-server-browser-"));
+      await fs2.promises.chmod(profileDir, 448);
+    }
     const userAgent = await userAgentArgs(binary);
     if (closed) throw new Error("Chrome launch was cancelled");
+    stderrHead = "";
+    stderrTail = "";
     child = spawn(binary, [
       "--headless=new",
       // Headless mode sets navigator.webdriver, which Google sign-in also refuses.
@@ -5761,9 +6230,14 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
       "about:blank"
     ], {
       env: { ...process.env },
-      stdio: ["ignore", "ignore", "ignore"],
+      stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true
+    });
+    child.stderr?.on("data", (chunk) => {
+      const text2 = String(chunk);
+      if (stderrHead.length < 2048) stderrHead += text2.slice(0, 2048 - stderrHead.length);
+      stderrTail = (stderrTail + text2).slice(-3072);
     });
     let exitError = null;
     child.once("error", (error) => {
@@ -5771,17 +6245,22 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
     });
     child.once("exit", (code, signal) => {
       if (closed) return;
-      if (!result) exitError = new Error(`Chrome exited during startup (code ${code ?? "null"}, signal ${signal ?? "none"})`);
-      else for (const listener of exitListeners) listener({ code, signal });
+      if (!result) {
+        const details = stderrSummary();
+        exitError = new Error(`Chrome exited during startup (code ${code ?? "null"}, signal ${signal ?? "none"})${details ? `
+${details}` : ""}`);
+      } else {
+        for (const listener of exitListeners) listener({ code, signal });
+      }
     });
     const deadline = Date.now() + startupTimeoutMs;
-    const activePortPath = path.join(profileDir, "DevToolsActivePort");
+    const activePortPath = path2.join(profileDir, "DevToolsActivePort");
     let endpoint = null;
     while (!endpoint && Date.now() < deadline) {
       if (closed) throw new Error("Chrome launch was cancelled");
       if (exitError) throw exitError;
       try {
-        endpoint = parseEndpoint(await fs.promises.readFile(activePortPath, "utf8"));
+        endpoint = parseEndpoint(await fs2.promises.readFile(activePortPath, "utf8"));
       } catch {
       }
       if (!endpoint) await wait(40);
@@ -5800,7 +6279,21 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
         launchPromise = launch().catch(async (error) => {
           killChild();
           await removeProfile();
+          const current = lease;
+          lease = null;
+          if (current) {
+            try {
+              await current.release();
+            } catch (releaseError) {
+              const combined = new Error(`${error.message}
+The profile lease at ${current.leaseDir} could not be released: ${releaseError.message}. Remove it before retrying.`);
+              combined.cause = error;
+              throw combined;
+            }
+          }
           throw error;
+        }).finally(() => {
+          launchPromise = null;
         });
       }
       return launchPromise;
@@ -5810,13 +6303,26 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
       closed = true;
       const processToWait = child;
       const exited = waitForExit(processToWait);
-      killChild();
+      const endpoint = result?.endpoint;
+      if (persistentProfile && endpoint) {
+        await requestGracefulClose(endpoint);
+        if (!await exitedWithin(processToWait, 1e3)) killChild();
+      } else {
+        killChild();
+      }
       await launchPromise?.catch(() => {
       });
       await exited;
       await removeProfile();
-      child = null;
-      result = null;
+      const current = lease;
+      lease = null;
+      try {
+        await current?.release();
+      } finally {
+        profileDir = null;
+        child = null;
+        result = null;
+      }
     },
     onExit(listener) {
       exitListeners.add(listener);
@@ -5832,7 +6338,7 @@ var createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15e3 } = {}) 
 };
 
 // src/context-menu.js
-import crypto2 from "node:crypto";
+import crypto3 from "node:crypto";
 var MENU_WORLD = "openchamber-menu";
 var MENU_BINDING = "openchamberMenu";
 var THEME_PROPERTIES = Object.freeze({
@@ -5962,7 +6468,7 @@ var call = (page, contextId, fn, argument) => page.cdp.sendSession(page.sessionI
   returnByValue: true
 });
 var DEFAULT_THEME = Object.freeze({ dark: false, properties: {} });
-var createContextMenu = ({ navigationState, readSelection, onAction }) => {
+var createContextMenu = ({ navigationState, readSelection: readSelection2, onAction }) => {
   let observing = null;
   let open = null;
   const close = async () => {
@@ -5983,7 +6489,7 @@ var createContextMenu = ({ navigationState, readSelection, onAction }) => {
     },
     async observe(page) {
       await close();
-      const selection = await readSelection().catch(() => "");
+      const selection = await readSelection2().catch(() => "");
       const world = await page.cdp.sendSession(page.sessionId, "Page.createIsolatedWorld", {
         frameId: page.targetId,
         worldName: MENU_WORLD
@@ -5998,7 +6504,7 @@ var createContextMenu = ({ navigationState, readSelection, onAction }) => {
       const result = (await call(page, current.contextId, settleContextMenu)).result?.value;
       if (!result || result.handled) return;
       const { canGoBack, canGoForward } = navigationState();
-      const token = crypto2.randomUUID();
+      const token = crypto3.randomUUID();
       await call(page, current.contextId, openContextMenu, {
         x: result.x,
         y: result.y,
@@ -6032,10 +6538,808 @@ var createContextMenu = ({ navigationState, readSelection, onAction }) => {
   };
 };
 
+// src/mark-cdp.js
+var FRAME_LIMIT = 20;
+var DEPTH_LIMIT = 8;
+var cssEscape = (value) => String(value).replace(/[^a-zA-Z0-9_-]/g, (character) => `\\${character}`);
+var attrMap = (attributes) => {
+  const result = {};
+  if (!Array.isArray(attributes)) return result;
+  for (let index = 0; index + 1 < attributes.length; index += 2) {
+    const name = attributes[index];
+    const value = attributes[index + 1];
+    if (typeof name === "string" && typeof value === "string") result[name] = value;
+  }
+  return result;
+};
+var nodeName = (node) => String(node?.localName || node?.nodeName || "").toLowerCase();
+var isFrameNode = (node) => {
+  const name = nodeName(node);
+  return name === "iframe" || name === "frame";
+};
+var quadRect = (quad) => {
+  if (!Array.isArray(quad) || quad.length < 8) return null;
+  const xs = [quad[0], quad[2], quad[4], quad[6]];
+  const ys = [quad[1], quad[3], quad[5], quad[7]];
+  const left = Math.min(...xs);
+  const top = Math.min(...ys);
+  const right = Math.max(...xs);
+  const bottom = Math.max(...ys);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+};
+var elementChildren = (node) => {
+  const children = Array.isArray(node?.children) ? node.children : Array.isArray(node?.childNodes) ? node.childNodes : [];
+  return children.filter((child) => child?.nodeType === 1);
+};
+var frameTreeIndex = (frameTree) => {
+  const frames = /* @__PURE__ */ new Map();
+  const visit = (node, parentId) => {
+    const frame = node?.frame;
+    if (!frame?.id) return;
+    frames.set(frame.id, {
+      id: frame.id,
+      parentId: frame.parentId || parentId || null,
+      url: frame.url || "",
+      name: frame.name || ""
+    });
+    for (const child of node?.childFrames ?? []) visit(child, frame.id);
+  };
+  visit(frameTree, null);
+  return frames;
+};
+var createMarkCdp = ({
+  cdp,
+  sessionId,
+  frameId,
+  url = "",
+  title = ""
+}) => {
+  const mainSession = sessionId;
+  const mainFrame = frameId;
+  const frameSessions = /* @__PURE__ */ new Map([[mainFrame, mainSession]]);
+  const frameContexts = /* @__PURE__ */ new Map();
+  const documents = /* @__PURE__ */ new Map();
+  const framePaths = /* @__PURE__ */ new Map();
+  const attached = /* @__PURE__ */ new Set();
+  let frames = null;
+  let closed = false;
+  const send = (session, method, params = {}) => cdp.sendSession(session, method, params);
+  const describe = async (session, id, depth = 0, pierce = true, byBackend = false) => {
+    const params = byBackend ? { backendNodeId: id } : { nodeId: id };
+    const response = await send(session, "DOM.describeNode", { ...params, depth, pierce });
+    return response?.node ?? null;
+  };
+  const boxModel = async (session, nodeId) => {
+    try {
+      const response = await send(session, "DOM.getBoxModel", { nodeId });
+      return response?.model ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const boxModelFor = async (session, node) => {
+    const params = node?.nodeId ? { nodeId: node.nodeId } : { backendNodeId: node?.backendNodeId };
+    try {
+      const response = await send(session, "DOM.getBoxModel", params);
+      return response?.model ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const loadFrames = async () => {
+    if (frames) return frames;
+    frames = /* @__PURE__ */ new Map();
+    try {
+      const response = await send(mainSession, "Page.getFrameTree");
+      frames = frameTreeIndex(response?.frameTree);
+    } catch {
+      frames = /* @__PURE__ */ new Map();
+    }
+    return frames;
+  };
+  const attachFrame = async (targetFrameId) => {
+    if (!targetFrameId || targetFrameId === mainFrame) return mainSession;
+    const cached = frameSessions.get(targetFrameId);
+    if (cached) return cached;
+    if (frameSessions.size >= FRAME_LIMIT) return null;
+    let childSession;
+    try {
+      childSession = await cdp.attach(targetFrameId);
+    } catch {
+      return null;
+    }
+    attached.add(childSession);
+    frameSessions.set(targetFrameId, childSession);
+    await Promise.allSettled([
+      send(childSession, "Page.enable"),
+      send(childSession, "DOM.enable"),
+      send(childSession, "Runtime.enable")
+    ]);
+    return childSession;
+  };
+  const contextFor = async (targetFrameId) => {
+    if (!targetFrameId || targetFrameId === mainFrame) return null;
+    const cached = frameContexts.get(targetFrameId);
+    if (cached) return cached;
+    try {
+      const response = await send(mainSession, "Page.createIsolatedWorld", {
+        frameId: targetFrameId,
+        worldName: "openchamber-mark-hit"
+      });
+      const contextId = response?.executionContextId;
+      if (Number.isInteger(contextId)) {
+        frameContexts.set(targetFrameId, contextId);
+        return contextId;
+      }
+    } catch {
+    }
+    return null;
+  };
+  const loadDocument = async (session) => {
+    const response = await send(session, "DOM.getDocument", { depth: -1, pierce: true });
+    const root = response?.root;
+    if (!root) throw new Error("Chrome returned no DOM document");
+    const nodes = /* @__PURE__ */ new Map();
+    const visit = (node, parent, scope, shadowHost) => {
+      if (!node) return;
+      let rootScope = scope;
+      let parentNode = parent;
+      if (node.nodeType === 9) {
+        rootScope = node;
+        parentNode = null;
+      }
+      if (node.backendNodeId) {
+        nodes.set(node.backendNodeId, {
+          node,
+          parent: parentNode,
+          root: rootScope,
+          host: shadowHost ?? null
+        });
+      }
+      for (const shadow of node.shadowRoots ?? []) visit(shadow, null, shadow, node);
+      for (const child of node.children ?? []) visit(child, node, rootScope, shadowHost);
+      if (node.contentDocument) visit(node.contentDocument, null, node.contentDocument, null);
+    };
+    visit(root, null, root, null);
+    const document2 = { root, nodes };
+    documents.set(session, document2);
+    return document2;
+  };
+  const documentFor = async (session) => documents.get(session) ?? loadDocument(session);
+  const entryFor = async (session, backendNodeId) => {
+    let document2 = await documentFor(session);
+    let entry = document2.nodes.get(backendNodeId);
+    if (!entry) {
+      document2 = await loadDocument(session);
+      entry = document2.nodes.get(backendNodeId);
+    }
+    return entry ?? null;
+  };
+  const segmentFor = async (session, entry) => {
+    const { node, parent, root } = entry;
+    const attributes = attrMap(node.attributes);
+    const tag = nodeName(node) || "*";
+    if (attributes.id) {
+      const selector = `#${cssEscape(attributes.id)}`;
+      try {
+        const matches = await send(session, "DOM.querySelectorAll", { nodeId: root.nodeId, selector });
+        if (Array.isArray(matches?.nodeIds) && matches.nodeIds.length === 1) return selector;
+      } catch {
+      }
+    }
+    let segment = tag;
+    if (attributes.class) {
+      const classes = attributes.class.trim().split(/\s+/).filter(Boolean).slice(0, 2);
+      if (classes.length > 0) segment += `.${classes.map(cssEscape).join(".")}`;
+    }
+    const siblings = parent ? elementChildren(parent).filter((child) => child.nodeName === node.nodeName) : [];
+    if (siblings.length > 1) segment += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+    return segment;
+  };
+  const selectorForNode = async (session, backendNodeId) => {
+    let entry = await entryFor(session, backendNodeId);
+    if (!entry) return { selector: "", shadowPath: [] };
+    const segments = [];
+    while (entry?.node?.nodeType === 1 && segments.length < DEPTH_LIMIT) {
+      segments.unshift(await segmentFor(session, entry));
+      if (entry.root?.nodeType === 9) break;
+      if (entry.root?.nodeType === 11) {
+        const host = entry.host;
+        if (!host?.backendNodeId) break;
+        entry = await entryFor(session, host.backendNodeId);
+        continue;
+      }
+      break;
+    }
+    if (segments.length === 0) return { selector: "", shadowPath: [] };
+    if (segments.length === 1) return { selector: segments[0], shadowPath: [] };
+    return {
+      selector: "",
+      shadowPath: segments,
+      shadowHostSelector: segments[0],
+      shadowSelector: segments[segments.length - 1]
+    };
+  };
+  const frameSelector = async (session, backendNodeId) => {
+    const path6 = await selectorForNode(session, backendNodeId);
+    return path6.shadowPath.length > 0 ? path6.shadowPath.join(" >>> ") : path6.selector;
+  };
+  const findFrameOwner = async (parentSession, targetFrameId) => {
+    try {
+      const owner = await send(parentSession, "DOM.getFrameOwner", { frameId: targetFrameId });
+      if (Number.isInteger(owner?.backendNodeId)) return owner.backendNodeId;
+    } catch {
+    }
+    try {
+      const document2 = await documentFor(parentSession);
+      for (const entry of document2.nodes.values()) {
+        if (!isFrameNode(entry.node)) continue;
+        const described = await describe(parentSession, entry.node.backendNodeId, 0, true, true);
+        if (described?.frameId === targetFrameId) return entry.node.backendNodeId;
+      }
+    } catch {
+    }
+    return null;
+  };
+  const framePath = async (targetFrameId) => {
+    if (!targetFrameId || targetFrameId === mainFrame) return [];
+    const cached = framePaths.get(targetFrameId);
+    if (cached) return cached;
+    const tree = await loadFrames();
+    const frame = tree.get(targetFrameId);
+    if (!frame) {
+      framePaths.set(targetFrameId, []);
+      return [];
+    }
+    const parentId = frame.parentId || mainFrame;
+    const parentSession = await attachFrame(parentId) ?? mainSession;
+    const owner = await findFrameOwner(parentSession, targetFrameId);
+    const selector = Number.isInteger(owner) ? await frameSelector(parentSession, owner) : "";
+    if (!selector) {
+      framePaths.set(targetFrameId, []);
+      return [];
+    }
+    const parentPath = await framePath(parentId);
+    const path6 = [...parentPath, selector];
+    framePaths.set(targetFrameId, path6);
+    return path6;
+  };
+  const queryPath = async (session, rootNodeId, segments) => {
+    if (!Array.isArray(segments) || segments.length === 0) return null;
+    let root = rootNodeId;
+    let nodeId = null;
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (typeof segment !== "string" || segment.length === 0) return null;
+      try {
+        const result = await send(session, "DOM.querySelector", { nodeId: root, selector: segment });
+        nodeId = result?.nodeId ?? null;
+      } catch {
+        return null;
+      }
+      if (!nodeId) return null;
+      if (index < segments.length - 1) {
+        const described = await describe(session, nodeId, 0);
+        const shadow = described?.shadowRoots?.[0];
+        if (!shadow?.nodeId) return null;
+        root = shadow.nodeId;
+      }
+    }
+    return nodeId;
+  };
+  const pathSegments = (value) => typeof value === "string" ? value.split(" >>> ").filter(Boolean) : [];
+  const hitAt = async ({ x, y }) => {
+    let session = mainSession;
+    let px = x;
+    let py = y;
+    let offsetX = 0;
+    let offsetY = 0;
+    let selectors = [];
+    for (let depth = 0; depth < DEPTH_LIMIT; depth += 1) {
+      const location = await send(session, "DOM.getNodeForLocation", {
+        x: Math.round(px),
+        y: Math.round(py),
+        includeUserAgentShadowDOM: true
+      });
+      if (!Number.isInteger(location?.backendNodeId)) return null;
+      const node = await describe(
+        session,
+        location.nodeId ?? location.backendNodeId,
+        0,
+        true,
+        !location.nodeId
+      );
+      if (!node) return null;
+      const hitFrameId = node.frameId ?? location.frameId;
+      if (isFrameNode(node) && hitFrameId) {
+        const path6 = await framePath(hitFrameId);
+        const box = await boxModelFor(session, node);
+        const content = quadRect(box?.content);
+        const childSession = await attachFrame(hitFrameId);
+        if (!childSession || childSession === session) {
+          return {
+            session,
+            node,
+            frameSelectors: [],
+            offsetX,
+            offsetY,
+            frameId: hitFrameId
+          };
+        }
+        selectors = path6.length > 0 ? path6 : [await frameSelector(session, node.backendNodeId)];
+        if (content) {
+          px -= content.x;
+          py -= content.y;
+          offsetX += content.x;
+          offsetY += content.y;
+        }
+        session = childSession;
+        continue;
+      }
+      if (hitFrameId && hitFrameId !== mainFrame) {
+        const childSession = await attachFrame(hitFrameId);
+        if (!childSession || childSession === session) {
+          const ownerBackend = await findFrameOwner(session, hitFrameId);
+          const ownerNode = ownerBackend ? { backendNodeId: ownerBackend } : null;
+          const box = ownerNode ? await boxModelFor(session, ownerNode) : null;
+          const content = quadRect(box?.content) ?? quadRect(box?.border);
+          const contextId = await contextFor(hitFrameId);
+          if (content && contextId !== null) {
+            const evaluated = await send(session, "Runtime.evaluate", {
+              contextId,
+              expression: `document.elementFromPoint(${Math.round(px - content.x)}, ${Math.round(py - content.y)})`,
+              objectGroup: "openchamber-mark"
+            });
+            const objectId = evaluated?.result?.objectId;
+            if (objectId) {
+              let inner = null;
+              try {
+                const described = await send(session, "DOM.describeNode", {
+                  objectId,
+                  depth: 0,
+                  pierce: true
+                });
+                inner = described?.node ?? null;
+              } catch {
+              }
+              if (inner) {
+                return {
+                  session,
+                  node: inner,
+                  frameSelectors: await framePath(hitFrameId),
+                  offsetX,
+                  offsetY,
+                  frameId: hitFrameId
+                };
+              }
+            }
+          }
+        }
+      }
+      if (selectors.length === 0 && hitFrameId && hitFrameId !== mainFrame) {
+        selectors = await framePath(hitFrameId);
+      }
+      return { session, node, frameSelectors: selectors, offsetX, offsetY, frameId: hitFrameId ?? mainFrame };
+    }
+    return null;
+  };
+  const elementInfo = async (session, backendNodeId) => {
+    const resolved = await send(session, "DOM.resolveNode", { backendNodeId });
+    const objectId = resolved?.object?.objectId;
+    if (!objectId) return {};
+    try {
+      const response = await send(session, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function () {
+          const el = this;
+          const readText = (value) => String(value ?? '').replace(/\\s+/g, ' ').trim();
+          const attributes = {};
+          for (const name of ['id', 'class', 'name', 'type', 'role', 'href', 'src', 'alt', 'title', 'placeholder', 'aria-label', 'aria-labelledby', 'data-testid']) {
+            const value = el.getAttribute(name);
+            if (value) attributes[name] = value;
+          }
+          const text = readText(el.innerText ?? el.textContent).slice(0, 500);
+          const labelledBy = el.getAttribute('aria-labelledby');
+          let name = el.getAttribute('aria-label') || '';
+          if (!name && labelledBy) {
+            name = labelledBy.split(/\\s+/).map((id) => {
+              try { return el.ownerDocument.getElementById(id)?.textContent ?? ''; } catch { return ''; }
+            }).join(' ');
+          }
+          if (!name && el.labels && el.labels.length > 0) {
+            name = Array.from(el.labels, (item) => item.textContent ?? '').join(' ');
+          }
+          if (!name && el.tagName === 'IMG') name = el.getAttribute('alt') ?? '';
+          if (!name) name = el.getAttribute('title') ?? text;
+          let frameUrl = '';
+          let frameTitle = '';
+          try {
+            frameUrl = el.ownerDocument.location?.href ?? '';
+            frameTitle = el.ownerDocument.title ?? '';
+          } catch {}
+          return {
+            tag: el.tagName.toLowerCase(),
+            role: el.getAttribute('role') || '',
+            name: readText(name).slice(0, 300),
+            text,
+            attributes,
+            frameUrl,
+            frameTitle,
+          };
+        }`,
+        returnByValue: true
+      });
+      return response?.result?.value ?? {};
+    } catch {
+      return {};
+    }
+  };
+  const describeHit = async (hit) => {
+    const path6 = await selectorForNode(hit.session, hit.node.backendNodeId);
+    const info = await elementInfo(hit.session, hit.node.backendNodeId);
+    const frameSelectors = Array.isArray(hit.frameSelectors) && hit.frameSelectors.length > 0 ? hit.frameSelectors : hit.frameId && hit.frameId !== mainFrame ? await framePath(hit.frameId) : [];
+    let rect = null;
+    const box = await boxModelFor(hit.session, hit.node);
+    const quad = quadRect(box?.border) ?? quadRect(box?.content);
+    if (quad) {
+      rect = {
+        x: quad.x + (hit.session === mainSession ? 0 : hit.offsetX),
+        y: quad.y + (hit.session === mainSession ? 0 : hit.offsetY),
+        width: quad.width,
+        height: quad.height
+      };
+    }
+    return {
+      selector: path6.selector ?? "",
+      shadowHostSelector: path6.shadowHostSelector ?? "",
+      shadowSelector: path6.shadowSelector ?? "",
+      shadowPath: Array.isArray(path6.shadowPath) ? path6.shadowPath : [],
+      frameSelectors,
+      frameUrl: frameSelectors.length > 0 ? info.frameUrl ?? "" : "",
+      frameTitle: frameSelectors.length > 0 ? info.frameTitle ?? "" : "",
+      tag: info.tag || nodeName(hit.node),
+      role: info.role ?? "",
+      name: info.name ?? "",
+      text: info.text ?? "",
+      attributes: info.attributes ?? {},
+      rect,
+      url,
+      title
+    };
+  };
+  const resolveOne = async (item) => {
+    let session = mainSession;
+    let root = (await documentFor(mainSession)).root.nodeId;
+    let offsetX = 0;
+    let offsetY = 0;
+    for (const selector of Array.isArray(item.frameSelectors) ? item.frameSelectors : []) {
+      const frameNodeId = await queryPath(session, root, pathSegments(selector));
+      if (!frameNodeId) return { id: item.id, status: "missing" };
+      const described = await describe(session, frameNodeId, 1);
+      const frameId2 = described?.frameId;
+      const box2 = await boxModel(session, frameNodeId);
+      const content = quadRect(box2?.content);
+      const childSession = frameId2 ? await attachFrame(frameId2) : null;
+      if (childSession) {
+        session = childSession;
+        root = (await documentFor(childSession)).root.nodeId;
+        if (content) {
+          offsetX += content.x;
+          offsetY += content.y;
+        }
+      } else {
+        const contentDocument = described?.contentDocument?.nodeId;
+        if (!contentDocument) return { id: item.id, status: "missing" };
+        root = contentDocument;
+      }
+    }
+    const segments = Array.isArray(item.shadowPath) && item.shadowPath.length > 0 ? item.shadowPath : item.shadowHostSelector && item.shadowSelector ? [item.shadowHostSelector, item.shadowSelector] : item.selector ? [item.selector] : [];
+    const nodeId = await queryPath(session, root, segments);
+    if (!nodeId) return { id: item.id, status: "missing" };
+    let rect = null;
+    const box = await boxModel(session, nodeId);
+    const quad = quadRect(box?.border) ?? quadRect(box?.content);
+    if (quad) {
+      rect = {
+        x: quad.x + (session === mainSession ? 0 : offsetX),
+        y: quad.y + (session === mainSession ? 0 : offsetY),
+        width: quad.width,
+        height: quad.height
+      };
+    }
+    return { id: item.id, status: "found", rect };
+  };
+  return {
+    describeAt: async (point) => {
+      const hit = await hitAt(point);
+      return hit ? describeHit(hit) : null;
+    },
+    resolve: async (items) => {
+      const results = [];
+      for (const item of Array.isArray(items) ? items : []) {
+        try {
+          results.push(await resolveOne(item));
+        } catch {
+          results.push({ id: item?.id, status: "error" });
+        }
+      }
+      return results;
+    },
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await Promise.allSettled([...attached].map((childSession) => cdp.send("Target.detachFromTarget", { sessionId: childSession })));
+      attached.clear();
+    }
+  };
+};
+
+// src/mark.js
+import crypto4 from "node:crypto";
+var MARK_WORLD = "openchamber-mark";
+var MARK_LIMIT = 50;
+var MAX_SELECTOR = 2e3;
+var MAX_TAG = 60;
+var MAX_NAME = 300;
+var MAX_TEXT = 500;
+var MAX_ATTRIBUTE_NAME = 60;
+var MAX_ATTRIBUTE_VALUE = 240;
+var MAX_ATTRIBUTES = 20;
+var ATTRIBUTE_NAMES = /* @__PURE__ */ new Set([
+  "id",
+  "class",
+  "name",
+  "type",
+  "role",
+  "href",
+  "src",
+  "alt",
+  "title",
+  "placeholder",
+  "aria-label",
+  "aria-labelledby",
+  "data-testid"
+]);
+var clean = (value, maximum) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, maximum);
+var finite = (value) => typeof value === "number" && Number.isFinite(value) ? value : null;
+var cleanRect = (rect) => {
+  if (!rect || typeof rect !== "object") return null;
+  const x = finite(rect.x);
+  const y = finite(rect.y);
+  const width = finite(rect.width);
+  const height = finite(rect.height);
+  if (x === null || y === null || width === null || height === null) return null;
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.max(0, Math.round(width)),
+    height: Math.max(0, Math.round(height))
+  };
+};
+var cleanAttributes = (value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const attributes = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (Object.keys(attributes).length >= MAX_ATTRIBUTES) break;
+    if (typeof name !== "string" || name.length === 0 || name.length > MAX_ATTRIBUTE_NAME) continue;
+    if (!ATTRIBUTE_NAMES.has(name)) continue;
+    if (typeof entry !== "string" || entry.length === 0) continue;
+    attributes[name] = entry.slice(0, MAX_ATTRIBUTE_VALUE);
+  }
+  return attributes;
+};
+var cleanFrameSelectors = (value) => (Array.isArray(value) ? value : []).filter((entry) => typeof entry === "string").map((entry) => clean(entry, MAX_SELECTOR)).filter(Boolean).slice(0, 8);
+var cleanShadowPath = (value) => (Array.isArray(value) ? value : []).filter((entry) => typeof entry === "string").map((entry) => clean(entry, MAX_SELECTOR)).filter(Boolean).slice(0, 8);
+var sanitizeMarkPayload = (payload, { tabId, url = "", title = "" } = {}) => {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const tag = clean(payload.tag, MAX_TAG);
+  if (!tag) return null;
+  return {
+    id: crypto4.randomUUID(),
+    tabId: typeof tabId === "string" ? tabId : "",
+    url: clean(payload.url, MAX_SELECTOR) || clean(url, MAX_SELECTOR),
+    title: clean(payload.title, MAX_NAME) || clean(title, MAX_NAME),
+    selector: clean(payload.selector, MAX_SELECTOR),
+    shadowHostSelector: clean(payload.shadowHostSelector, MAX_SELECTOR),
+    shadowSelector: clean(payload.shadowSelector, MAX_SELECTOR),
+    shadowPath: cleanShadowPath(payload.shadowPath),
+    frameSelectors: cleanFrameSelectors(payload.frameSelectors),
+    frameUrl: clean(payload.frameUrl, MAX_SELECTOR),
+    frameTitle: clean(payload.frameTitle, MAX_NAME),
+    tag,
+    role: clean(payload.role, MAX_NAME),
+    name: clean(payload.name, MAX_NAME),
+    text: clean(payload.text, MAX_TEXT),
+    attributes: cleanAttributes(payload.attributes),
+    rect: cleanRect(payload.rect),
+    createdAt: Date.now(),
+    resolved: true
+  };
+};
+var resolveMarkItems = (marks) => marks.map((mark) => ({
+  id: mark.id,
+  selector: mark.selector ?? "",
+  shadowHostSelector: mark.shadowHostSelector ?? "",
+  shadowSelector: mark.shadowSelector ?? "",
+  shadowPath: Array.isArray(mark.shadowPath) ? [...mark.shadowPath] : [],
+  frameSelectors: Array.isArray(mark.frameSelectors) ? [...mark.frameSelectors] : []
+}));
+function installMarkOverlay() {
+  const state = globalThis.__openchamberMark ??= {};
+  state.cancel?.();
+  const host = document.createElement("openchamber-mark");
+  host.setAttribute("style", "all: initial; position: fixed; inset: 0; z-index: 2147483647; display: block; pointer-events: none;");
+  const root = host.attachShadow({ mode: "closed" });
+  const style = document.createElement("style");
+  style.textContent = [
+    ".box { position: fixed; box-sizing: border-box; border: 2px solid #4f8cff; border-radius: 3px; background: rgba(79, 140, 255, .14); pointer-events: none; }",
+    ".label { position: fixed; max-width: 340px; padding: 3px 6px; overflow: hidden; border-radius: 4px; background: #111827; color: #f9fafb; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }"
+  ].join("\n");
+  const box = document.createElement("div");
+  box.className = "box";
+  box.hidden = true;
+  const label = document.createElement("div");
+  label.className = "label";
+  label.hidden = true;
+  root.append(style, box, label);
+  document.documentElement.append(host);
+  let lastPoint = null;
+  let hoverRaf = null;
+  let overFrame = false;
+  let stopped = false;
+  const hide = () => {
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
+    box.hidden = true;
+    label.hidden = true;
+  };
+  const place = (left, top, width, height, text2) => {
+    box.hidden = false;
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${width}px`;
+    box.style.height = `${height}px`;
+    label.textContent = text2;
+    label.hidden = false;
+    const labelWidth = label.getBoundingClientRect().width;
+    label.style.left = `${Math.max(4, Math.min(left, innerWidth - labelWidth - 4))}px`;
+    label.style.top = `${top > 24 ? top - 22 : top + height + 4}px`;
+  };
+  const isFrame = (element) => element?.tagName === "IFRAME" || element?.tagName === "FRAME";
+  const hitAt = (x, y) => {
+    let element = document.elementFromPoint(x, y);
+    for (let depth = 0; depth < 8 && element?.shadowRoot; depth += 1) {
+      const inner = element.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === element) break;
+      element = inner;
+    }
+    return element;
+  };
+  const labelFor = (element) => {
+    const tag = String(element.tagName ?? "").toLowerCase();
+    const id = element.id ? `#${element.id}` : "";
+    const className = element.getAttribute?.("class") ?? "";
+    const classes = String(className).trim().split(/\s+/).filter(Boolean).slice(0, 2);
+    return `${tag}${id}${classes.map((name) => `.${name}`).join("")}`;
+  };
+  const drawAt = (point) => {
+    const element = hitAt(point.x, point.y);
+    if (!element || isFrame(element)) {
+      overFrame = true;
+      lastPoint = null;
+      hide();
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    if (!(rect.width > 0 && rect.height > 0)) {
+      hide();
+      return;
+    }
+    place(rect.left, rect.top, rect.width, rect.height, labelFor(element));
+  };
+  const scheduleHover = () => {
+    if (stopped || hoverRaf !== null || overFrame || !lastPoint) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = null;
+      if (!stopped && lastPoint && !overFrame) drawAt(lastPoint);
+    });
+  };
+  const onPointerMove = (event) => {
+    if (stopped) return;
+    lastPoint = { x: event.clientX, y: event.clientY };
+    overFrame = false;
+    scheduleHover();
+  };
+  const onPointerOver = (event) => {
+    if (stopped || !isFrame(event.target)) return;
+    overFrame = true;
+    lastPoint = null;
+    hide();
+  };
+  const onPointerOut = (event) => {
+    if (stopped) return;
+    if (isFrame(event.target)) {
+      overFrame = false;
+      return;
+    }
+    if (isFrame(event.relatedTarget)) {
+      overFrame = true;
+      lastPoint = null;
+      hide();
+    }
+  };
+  const onViewportChange = () => {
+    if (stopped) return;
+    if (lastPoint && !overFrame) scheduleHover();
+    else hide();
+  };
+  addEventListener("pointermove", onPointerMove, true);
+  addEventListener("pointerover", onPointerOver, true);
+  addEventListener("pointerout", onPointerOut, true);
+  addEventListener("scroll", onViewportChange, true);
+  addEventListener("resize", onViewportChange, true);
+  state.stop = () => {
+    stopped = true;
+    overFrame = true;
+    hide();
+  };
+  state.describe = () => ({
+    hidden: box.hidden,
+    label: label.textContent,
+    left: box.style.left,
+    top: box.style.top,
+    width: box.style.width,
+    height: box.style.height
+  });
+  state.cancel = () => {
+    removeEventListener("pointermove", onPointerMove, true);
+    removeEventListener("pointerover", onPointerOver, true);
+    removeEventListener("pointerout", onPointerOut, true);
+    removeEventListener("scroll", onViewportChange, true);
+    removeEventListener("resize", onViewportChange, true);
+    if (hoverRaf !== null) cancelAnimationFrame(hoverRaf);
+    hoverRaf = null;
+    lastPoint = null;
+    overFrame = false;
+    host.remove();
+    box.hidden = true;
+    label.hidden = true;
+    state.cancel = null;
+    state.stop = null;
+    state.describe = null;
+  };
+  return { ok: true };
+}
+function callMarkOverlay({ method, argument }) {
+  const state = globalThis.__openchamberMark;
+  if (!state || typeof state[method] !== "function") return null;
+  return state[method](argument);
+}
+var call2 = (page, contextId, fn, argument) => page.cdp.sendSession(page.sessionId, "Runtime.callFunctionOn", {
+  functionDeclaration: fn.toString(),
+  executionContextId: contextId,
+  arguments: argument === void 0 ? [] : [{ value: argument }],
+  returnByValue: true,
+  awaitPromise: true
+});
+var installMark = async (page, contextId) => {
+  await call2(page, contextId, installMarkOverlay);
+};
+var hideMarkOverlay = async (page, contextId) => {
+  if (!Number.isInteger(contextId)) return;
+  await call2(page, contextId, callMarkOverlay, { method: "stop" }).catch(() => {
+  });
+};
+var cancelMark = async (page, contextId) => {
+  await call2(page, contextId, callMarkOverlay, { method: "cancel" }).catch(() => {
+  });
+};
+
 // src/config.js
-import fs2 from "node:fs";
+import fs3 from "node:fs";
 import net2 from "node:net";
-import path2 from "node:path";
+import path3 from "node:path";
 import { fileURLToPath } from "node:url";
 
 // src/policy-proxy.js
@@ -6431,7 +7735,26 @@ var parseAllowedNetwork = (value, index) => {
   }
   return Object.freeze({ cidr: value.cidr, address: cidr[1], prefix, ports: parsePorts(value.ports, label) });
 };
-var extensionRootFrom = (entryUrl) => path2.resolve(path2.dirname(fileURLToPath(entryUrl)), "..");
+var extensionRootFrom = (entryUrl) => path3.resolve(path3.dirname(fileURLToPath(entryUrl)), "..");
+var DEFAULT_SURFACE = Object.freeze({
+  quality: 72,
+  everyNthFrame: 1
+});
+var parseSurface = (value) => {
+  if (value === void 0) return DEFAULT_SURFACE;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("config.surface must be an object");
+  }
+  const quality = value.quality === void 0 ? DEFAULT_SURFACE.quality : value.quality;
+  const everyNthFrame = value.everyNthFrame === void 0 ? DEFAULT_SURFACE.everyNthFrame : value.everyNthFrame;
+  if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
+    throw new Error("config.surface.quality must be an integer from 1 to 100");
+  }
+  if (!Number.isInteger(everyNthFrame) || everyNthFrame < 1 || everyNthFrame > 10) {
+    throw new Error("config.surface.everyNthFrame must be an integer from 1 to 10");
+  }
+  return Object.freeze({ quality, everyNthFrame });
+};
 var parseConfig = (value) => {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("config.json must contain an object");
@@ -6449,19 +7772,30 @@ var parseConfig = (value) => {
   if (value.discoverDevServers !== void 0 && typeof value.discoverDevServers !== "boolean") {
     throw new Error("config.discoverDevServers must be true or false");
   }
+  const profileRoot = value.profileRoot;
+  if (profileRoot !== void 0 && profileRoot !== null) {
+    if (typeof profileRoot !== "string" || profileRoot.trim().length === 0) {
+      throw new Error("config.profileRoot must be a non-empty absolute path or null");
+    }
+    if (!path3.isAbsolute(profileRoot.trim())) {
+      throw new Error("config.profileRoot must be an absolute path");
+    }
+  }
   const allowedOrigins = (value.allowedOrigins ?? []).map(parseAllowedOrigin);
   return Object.freeze({
     chromePath: chromePath?.trim() ?? null,
+    profileRoot: profileRoot?.trim() ?? null,
+    surface: parseSurface(value.surface),
     allowedOrigins: Object.freeze([...new Set(allowedOrigins)]),
     allowedNetworks: Object.freeze((value.allowedNetworks ?? []).map(parseAllowedNetwork)),
     discoverDevServers: value.discoverDevServers === true
   });
 };
 var loadConfig = ({ entryUrl = import.meta.url, configPath } = {}) => {
-  const resolvedPath = configPath ?? path2.join(extensionRootFrom(entryUrl), "config.json");
+  const resolvedPath = configPath ?? path3.join(extensionRootFrom(entryUrl), "config.json");
   let value = {};
   try {
-    value = JSON.parse(fs2.readFileSync(resolvedPath, "utf8"));
+    value = JSON.parse(fs3.readFileSync(resolvedPath, "utf8"));
   } catch (error) {
     if (error instanceof SyntaxError) throw new Error(`Invalid JSON in ${resolvedPath}: ${error.message}`);
     if (error?.code !== "ENOENT") throw error;
@@ -6606,13 +7940,51 @@ var createNativeSelectCompatibility = ({ ensurePage, reportError }) => {
   };
 };
 
+// src/input-events.js
+var MAX_DRAG_MOVES = 4;
+var isPointerMove = (event) => event?.type === "pointer" && event.action === "move";
+var isDragging = (event) => (Number(event?.buttons) || 0) !== 0;
+var sampleDrag = (run) => {
+  if (run.length <= MAX_DRAG_MOVES) return run;
+  const indexes = /* @__PURE__ */ new Set();
+  for (let index = 0; index < MAX_DRAG_MOVES; index += 1) {
+    indexes.add(Math.round(index * (run.length - 1) / (MAX_DRAG_MOVES - 1)));
+  }
+  return [...indexes].sort((left, right) => left - right).map((index) => run[index]);
+};
+var coalesceSurfaceEvents = (events) => {
+  if (!Array.isArray(events) || events.length === 0) return [];
+  const result = [];
+  for (let index = 0; index < events.length; ) {
+    const event = events[index];
+    if (!isPointerMove(event)) {
+      result.push(event);
+      index += 1;
+      continue;
+    }
+    const run = [];
+    while (index < events.length && isPointerMove(events[index])) {
+      run.push(events[index]);
+      index += 1;
+    }
+    result.push(...run.some(isDragging) ? sampleDrag(run) : [run[run.length - 1]]);
+  }
+  return result;
+};
+
 // src/surface.js
 var BUTTON_NAMES = ["left", "middle", "right"];
 var KEY_CODES = Object.freeze({
   Backspace: 8,
   Tab: 9,
   Enter: 13,
+  Shift: 16,
+  Control: 17,
+  Alt: 18,
+  Pause: 19,
+  CapsLock: 20,
   Escape: 27,
+  Space: 32,
   PageUp: 33,
   PageDown: 34,
   End: 35,
@@ -6621,14 +7993,120 @@ var KEY_CODES = Object.freeze({
   ArrowUp: 38,
   ArrowRight: 39,
   ArrowDown: 40,
+  PrintScreen: 44,
   Insert: 45,
-  Delete: 46
+  Delete: 46,
+  Meta: 91,
+  ContextMenu: 93,
+  NumLock: 144,
+  ScrollLock: 145
 });
+var CUT_CLIPBOARD_TTL_MS = 5e3;
+var CODE_KEY_CODES = Object.freeze({
+  Space: 32,
+  Backquote: 192,
+  Minus: 189,
+  Equal: 187,
+  BracketLeft: 219,
+  Backslash: 220,
+  BracketRight: 221,
+  Semicolon: 186,
+  Quote: 222,
+  Comma: 188,
+  Period: 190,
+  Slash: 191,
+  IntlBackslash: 226,
+  IntlRo: 226,
+  IntlYen: 220,
+  NumpadAdd: 107,
+  NumpadSubtract: 109,
+  NumpadMultiply: 106,
+  NumpadDivide: 111,
+  NumpadDecimal: 110,
+  NumpadEqual: 187,
+  ControlLeft: 17,
+  ControlRight: 17,
+  ShiftLeft: 16,
+  ShiftRight: 16,
+  AltLeft: 18,
+  AltRight: 18,
+  MetaLeft: 91,
+  MetaRight: 92,
+  Pause: 19,
+  CapsLock: 20,
+  PrintScreen: 44,
+  ScrollLock: 145,
+  NumLock: 144,
+  ContextMenu: 93,
+  BrowserBack: 166,
+  BrowserForward: 167,
+  BrowserRefresh: 168,
+  BrowserStop: 169,
+  BrowserSearch: 170,
+  BrowserFavorites: 171,
+  BrowserHome: 172,
+  VolumeMute: 173,
+  VolumeDown: 174,
+  VolumeUp: 175,
+  AudioVolumeMute: 173,
+  AudioVolumeDown: 174,
+  AudioVolumeUp: 175,
+  MediaTrackNext: 176,
+  MediaTrackPrevious: 177,
+  MediaStop: 178,
+  MediaPlayPause: 179,
+  LaunchMail: 180,
+  MediaSelect: 181,
+  LaunchApp1: 182,
+  LaunchApp2: 183
+});
+var CODE_TEXT = Object.freeze({
+  Backquote: "`",
+  Minus: "-",
+  Equal: "=",
+  BracketLeft: "[",
+  Backslash: "\\",
+  BracketRight: "]",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+  Space: " ",
+  IntlBackslash: "\\",
+  IntlRo: "\\",
+  IntlYen: "\xA5"
+});
+var virtualKeyCode = (key, code) => {
+  const named = KEY_CODES[key];
+  if (named !== void 0) return named;
+  const mapped = CODE_KEY_CODES[code];
+  if (mapped !== void 0) return mapped;
+  const functionKey = /^F([1-9]|1[0-9]|2[0-4])$/.exec(code);
+  if (functionKey) return 111 + Number(functionKey[1]);
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+  if (/^Numpad[0-9]$/.test(code)) return 96 + Number(code.slice(6));
+  return key.length === 1 && /[a-z0-9]/i.test(key) ? key.toUpperCase().charCodeAt(0) : 0;
+};
+var unmodifiedTextFor = (code) => {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^Numpad[0-9]$/.test(code)) return code.slice(6);
+  return CODE_TEXT[code] ?? null;
+};
+var keyLocation = (code) => {
+  if (code.startsWith("Numpad")) return 3;
+  if (/^(Control|Shift|Alt|Meta)Left$/.test(code)) return 1;
+  if (/^(Control|Shift|Alt|Meta)Right$/.test(code)) return 2;
+  return 0;
+};
+var isCutChord = (event) => event.type === "key" && event.action === "down" && (event.modifiers.ctrl || event.modifiers.meta) && !event.modifiers.alt && !event.modifiers.shift && event.key.toLowerCase() === "x";
 var modifiersMask = (modifiers) => (modifiers.alt ? 1 : 0) | (modifiers.ctrl ? 2 : 0) | (modifiers.meta ? 4 : 0) | (modifiers.shift ? 8 : 0);
 var mouseButton = (button) => BUTTON_NAMES[button] ?? "none";
 var heldButton = (buttons) => buttons & 1 ? "left" : buttons & 2 ? "right" : buttons & 4 ? "middle" : "none";
 var baseCharacter = (key, code) => code === `Key${key.toUpperCase()}` || code === `Digit${key}`;
-var dispatchInput = async (page, event) => {
+var dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
   if (event.type === "text") {
     await page.cdp.sendSession(page.sessionId, "Input.insertText", { text: event.text });
     return;
@@ -6658,13 +8136,14 @@ var dispatchInput = async (page, event) => {
     return;
   }
   const { alt, ctrl, meta, shift } = event.modifiers;
-  const keyCode = KEY_CODES[event.key] ?? (event.key.length === 1 ? event.key.toUpperCase().charCodeAt(0) : 0);
+  const keyCode = virtualKeyCode(event.key, event.code);
   const single = [...event.key].length === 1;
   const composed = single && alt && !baseCharacter(event.key, event.code);
   const modifiers = composed && ctrl ? { alt: false, ctrl: false, meta, shift } : event.modifiers;
   const down = event.action === "down";
   const text2 = down && single && !meta && (composed || !alt && !ctrl) ? event.key : down && event.key === "Enter" && !alt && !ctrl && !meta ? "\r" : null;
   const selectAll = down && event.key.toLowerCase() === "a" && (ctrl || meta) && !alt && !shift;
+  const unmodifiedText = text2 ? unmodifiedTextFor(event.code) : null;
   await page.cdp.sendSession(page.sessionId, "Input.dispatchKeyEvent", {
     type: down ? "keyDown" : "keyUp",
     key: event.key,
@@ -6672,7 +8151,10 @@ var dispatchInput = async (page, event) => {
     modifiers: modifiersMask(modifiers),
     windowsVirtualKeyCode: keyCode,
     nativeVirtualKeyCode: keyCode,
-    ...text2 ? { text: text2, unmodifiedText: text2 } : {},
+    location: keyLocation(event.code),
+    isKeypad: event.code.startsWith("Numpad"),
+    autoRepeat,
+    ...text2 ? { text: text2, ...unmodifiedText ? { unmodifiedText } : {} } : {},
     ...selectAll ? { commands: ["selectAll"] } : {}
   });
 };
@@ -6706,11 +8188,18 @@ var clipboardExpression = `(() => {
   }
   return '';
 })()`;
+var readSelection = async (page) => {
+  const response = await page.cdp.sendSession(page.sessionId, "Runtime.evaluate", {
+    expression: clipboardExpression,
+    returnByValue: true
+  });
+  return typeof response.result?.value === "string" ? response.result.value : "";
+};
 var stopScreencast = (page) => {
   if (page?.cdp.isOpen) void page.cdp.sendSession(page.sessionId, "Page.stopScreencast").catch(() => {
   });
 };
-var createSurface = (runtime) => {
+var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
   const waiters = /* @__PURE__ */ new Set();
   let page = null;
   let unsubscribe = null;
@@ -6720,6 +8209,15 @@ var createSurface = (runtime) => {
   let startPromise = null;
   let target = 0;
   let swallowEscapeUp = false;
+  let pendingCut = null;
+  const pressedKeys = /* @__PURE__ */ new Set();
+  const clearPendingCut = () => {
+    pendingCut = null;
+  };
+  const clearCutRequest = () => {
+    const cut = runtime.cutRequest;
+    if (cut) runtime.clearCutClipboard?.(cut.id);
+  };
   const finishWaiter = (waiter, value) => {
     if (!waiters.delete(waiter)) return;
     clearTimeout(waiter.timer);
@@ -6768,8 +8266,8 @@ var createSurface = (runtime) => {
       try {
         await current.cdp.sendSession(current.sessionId, "Page.startScreencast", {
           format: "jpeg",
-          quality: 72,
-          everyNthFrame: 1
+          quality: surfaceConfig.quality,
+          everyNthFrame: surfaceConfig.everyNthFrame
         });
       } catch (error) {
         detach();
@@ -6821,7 +8319,25 @@ var createSurface = (runtime) => {
     async input(events, theme = null) {
       const current = await start();
       const menu = runtime.contextMenu;
-      for (const event of events) {
+      const pendingMoves = [];
+      let pendingError = null;
+      const flushPendingMoves = async () => {
+        if (pendingMoves.length > 0) await Promise.all(pendingMoves.splice(0));
+        if (!pendingError) return;
+        const error = pendingError;
+        pendingError = null;
+        throw error;
+      };
+      for (const event of coalesceSurfaceEvents(events)) {
+        if (event.type === "pointer" && event.action === "move") {
+          pendingMoves.push(dispatchInput(current, event).catch((error) => {
+            pendingError ??= error ?? new Error("Pointer move failed");
+          }));
+          continue;
+        }
+        await flushPendingMoves();
+        if (event.type === "pointer" && event.action !== "move") clearPendingCut();
+        if (await runtime.handleMarkInput?.(event, current)) continue;
         if (event.type === "key" && event.key === "Escape" && event.action === "up" && swallowEscapeUp) {
           swallowEscapeUp = false;
           continue;
@@ -6837,30 +8353,55 @@ var createSurface = (runtime) => {
         }
         if (secondary && event.action === "down") await menu.observe(current).catch(() => {
         });
-        await dispatchInput(current, event);
+        if (event.type === "key" && event.action === "down" && !isCutChord(event)) clearPendingCut();
+        if (isCutChord(event)) {
+          const text2 = (await readSelection(current).catch(() => "")).slice(0, GUEST_CLIPBOARD_TEXT_MAX);
+          const cutId = text2 ? runtime.offerCutClipboard?.(text2) ?? null : null;
+          pendingCut = { text: text2, at: Date.now(), cutId };
+        }
+        const keyId = event.type === "key" ? event.code || event.key : null;
+        const autoRepeat = keyId !== null && event.action === "down" && pressedKeys.has(keyId);
+        if (keyId !== null) {
+          if (event.action === "down") pressedKeys.add(keyId);
+          else pressedKeys.delete(keyId);
+        }
+        await dispatchInput(current, event, { autoRepeat });
         if (secondary && event.action === "up") await menu.settle(current, theme).catch(() => {
         });
       }
+      await flushPendingMoves();
     },
     control(controller) {
       if (runtime.controller !== controller) void runtime.contextMenu.close();
+      if (controller !== "user") {
+        clearPendingCut();
+        pressedKeys.clear();
+        void runtime.cancelMark?.();
+      }
       runtime.controller = controller;
     },
     resize({ width, height }) {
       return runtime.setPanelSize({ width, height });
     },
     async clipboard() {
-      const current = await start();
-      const response = await current.cdp.sendSession(current.sessionId, "Runtime.evaluate", {
-        expression: clipboardExpression,
-        returnByValue: true
-      });
-      return typeof response.result?.value === "string" ? response.result.value : "";
+      if (pendingCut && Date.now() - pendingCut.at <= CUT_CLIPBOARD_TTL_MS) {
+        const { text: text3, cutId } = pendingCut;
+        pendingCut = null;
+        if (cutId) runtime.clearCutClipboard?.(cutId);
+        return text3;
+      }
+      clearPendingCut();
+      const text2 = await readSelection(await start());
+      clearCutRequest();
+      return text2;
     },
     // The active tab changed: stop streaming the old one and wake long polls so
     // the next request starts on the new tab.
     retarget() {
       target += 1;
+      clearPendingCut();
+      clearCutRequest();
+      pressedKeys.clear();
       detach();
       latest = null;
       for (const waiter of waiters) finishWaiter(waiter, null);
@@ -6868,6 +8409,9 @@ var createSurface = (runtime) => {
     async close() {
       if (closed) return;
       closed = true;
+      clearPendingCut();
+      clearCutRequest();
+      pressedKeys.clear();
       for (const waiter of waiters) finishWaiter(waiter, null);
       await startPromise?.catch(() => {
       });
@@ -6894,17 +8438,38 @@ var createTab = (targetId, sessionId, openerId) => ({
   navigationTimer: null,
   problems: [],
   compatibility: null,
-  lastActive: 0
+  lastActive: 0,
+  marks: [],
+  markActive: false,
+  markReady: false,
+  markSession: null,
+  markError: null,
+  markContextId: null,
+  markFrameContexts: [],
+  markCdp: null,
+  markSwallowPointerUp: false,
+  markSwallowKeyUp: false
 });
 var isScopePage = (info, contextId) => info?.type === "page" && info.browserContextId === contextId && info.subtype !== "prerender";
+var persistentProfileDir = (profileRoot, scope) => {
+  if (typeof scope?.directory !== "string" || scope.directory.length === 0 || typeof scope?.sessionId !== "string" || scope.sessionId.length === 0) {
+    throw new Error("config.profileRoot requires a browser scope with project and chat context");
+  }
+  const key = crypto5.createHash("sha256").update(scope.directory).update("\0").update(scope.sessionId).digest("hex").slice(0, 32);
+  return path4.join(profileRoot, key);
+};
 var createBrowserRuntime = ({
   chromePath = null,
+  profileRoot = null,
+  scope = null,
   allowedOrigins = [],
   allowedNetworks = [],
   configPath = null,
-  devServers = null
+  devServers = null,
+  surface = DEFAULT_SURFACE
 } = {}) => {
-  const chrome = createChromeProcess({ chromePath });
+  const userDataDir = profileRoot ? persistentProfileDir(profileRoot, scope) : null;
+  const chrome = createChromeProcess({ chromePath, userDataDir });
   const proxy = createPolicyProxy({
     grants: [...originGrants(allowedOrigins), ...networkGrants(allowedNetworks)],
     configPath,
@@ -6954,6 +8519,22 @@ var createBrowserRuntime = ({
     },
     controller: "none",
     agentActive: false,
+    get markState() {
+      const current = activeTab();
+      return {
+        active: current?.markActive === true,
+        ready: current?.markReady === true,
+        session: current?.markSession ?? null,
+        error: current?.markError ?? null,
+        marks: (current?.marks ?? []).map((mark) => ({
+          ...mark,
+          attributes: { ...mark.attributes },
+          shadowPath: Array.isArray(mark.shadowPath) ? [...mark.shadowPath] : [],
+          frameSelectors: Array.isArray(mark.frameSelectors) ? [...mark.frameSelectors] : [],
+          rect: mark.rect ? { ...mark.rect } : null
+        }))
+      };
+    },
     get url() {
       return activeTab()?.url ?? "about:blank";
     },
@@ -6989,6 +8570,11 @@ var createBrowserRuntime = ({
       if (!copyRequest || Date.now() - copyRequest.at > 1e4) return null;
       return { id: copyRequest.id, text: copyRequest.text };
     },
+    // Text removed by a viewer's cut; the dock writes it to the host clipboard.
+    get cutRequest() {
+      if (!cutRequest || Date.now() - cutRequest.at > 1e4) return null;
+      return { id: cutRequest.id, text: cutRequest.text };
+    },
     get problemCounts() {
       const problems = activeTab()?.problems ?? [];
       return {
@@ -7009,7 +8595,87 @@ var createBrowserRuntime = ({
     current.problems.push(problem);
     if (current.problems.length > 50) current.problems.shift();
   };
-  const pageOf = (current) => ({ cdp, contextId, targetId: current.targetId, sessionId: current.sessionId });
+  const pageOf = (current) => ({ cdp, contextId, targetId: current.targetId, sessionId: current.sessionId, mainFrameId: current.mainFrameId });
+  const resetMarkState = (current) => {
+    if (!current) return;
+    current.markActive = false;
+    current.markReady = false;
+    current.markSession = null;
+    current.markError = null;
+    current.markContextId = null;
+    current.markFrameContexts = [];
+    current.markCdp?.close?.();
+    current.markCdp = null;
+    current.markSwallowPointerUp = false;
+    current.markSwallowKeyUp = false;
+  };
+  const cancelMarkContexts = async (current, contexts) => {
+    if (!current || contexts.length === 0) return;
+    await Promise.allSettled(contexts.map(({ contextId: contextId2 }) => cancelMark(pageOf(current), contextId2)));
+  };
+  const cancelMarkMode = async () => {
+    const current = activeTab();
+    if (!current) return;
+    const contexts = current.markFrameContexts.length > 0 ? current.markFrameContexts.slice() : current.markContextId === null ? [] : [{ frameId: current.mainFrameId, contextId: current.markContextId }];
+    resetMarkState(current);
+    await cancelMarkContexts(current, contexts);
+  };
+  const addMark = (current, payload) => {
+    const mark = sanitizeMarkPayload(payload, {
+      tabId: current.targetId,
+      url: current.url,
+      title: current.title
+    });
+    if (!mark) return false;
+    current.marks.push(mark);
+    if (current.marks.length > MARK_LIMIT) current.marks.splice(0, current.marks.length - MARK_LIMIT);
+    return true;
+  };
+  const resolveMarksFor = async (current) => {
+    if (!current || current.marks.length === 0) return [];
+    const resolver = createMarkCdp({
+      cdp,
+      sessionId: current.sessionId,
+      frameId: current.mainFrameId,
+      url: current.url,
+      title: current.title
+    });
+    let results;
+    let failed = false;
+    try {
+      results = await resolver.resolve(resolveMarkItems(current.marks));
+    } catch {
+      results = [];
+      failed = true;
+    } finally {
+      await resolver.close();
+    }
+    const byId = new Map(results.map((result) => [result.id, result]));
+    for (const mark of current.marks) {
+      const result = byId.get(mark.id);
+      if (failed) mark.resolved = null;
+      else if (result) mark.resolved = result.status === "error" ? null : result.status === "found";
+      else mark.resolved = false;
+      if (result?.rect) {
+        const { x, y, width, height } = result.rect;
+        if ([x, y, width, height].every(Number.isFinite)) {
+          mark.rect = {
+            x: Math.round(x),
+            y: Math.round(y),
+            width: Math.max(0, Math.round(width)),
+            height: Math.max(0, Math.round(height))
+          };
+        }
+      }
+    }
+    return current.marks.map((mark) => ({
+      ...mark,
+      attributes: { ...mark.attributes },
+      shadowPath: Array.isArray(mark.shadowPath) ? [...mark.shadowPath] : [],
+      frameSelectors: Array.isArray(mark.frameSelectors) ? [...mark.frameSelectors] : [],
+      rect: mark.rect ? { ...mark.rect } : null
+    }));
+  };
   const notifyTabs = () => {
     for (const listener of tabListeners) listener();
   };
@@ -7048,12 +8714,13 @@ var createBrowserRuntime = ({
   const activate = async (current) => {
     if (activeTargetId === current.targetId || tabs.get(current.targetId) !== current) return;
     const previous = activeTab();
+    if (previous?.markActive) await cancelMarkMode();
     if (previous) inspector.endTab(previous.sessionId);
     activeTargetId = current.targetId;
     activations += 1;
     current.lastActive = activations;
     void contextMenu.close();
-    surface.retarget();
+    surfaceController.retarget();
     notifyTabs();
     await cdp.sendSession(current.sessionId, "Page.bringToFront").catch(() => {
     });
@@ -7072,7 +8739,7 @@ var createBrowserRuntime = ({
       return;
     }
     activeTargetId = null;
-    surface.retarget();
+    surfaceController.retarget();
     const fallback = tabs.get(current.openerId) ?? [...tabs.values()].reduce((best, candidate) => !best || candidate.lastActive > best.lastActive ? candidate : best, null);
     if (fallback) void activate(fallback);
     else notifyTabs();
@@ -7136,16 +8803,20 @@ var createBrowserRuntime = ({
     if (!current) return;
     inspector.event(current.sessionId, event.method, event.params);
     if (event.method === "Page.frameNavigated" && event.params.frame?.id) {
-      if (!event.params.frame.parentId) {
-        current.mainFrameId = event.params.frame.id;
+      const frame = event.params.frame;
+      if (!frame.parentId) {
+        current.mainFrameId = frame.id;
+        current.marks = [];
+        resetMarkState(current);
         current.problems.length = 0;
         contextMenu.forget(current.sessionId);
-        current.url = event.params.frame.url;
+        current.url = frame.url;
         void refreshNavigation(current);
       }
-      current.compatibility.frameNavigated(event.params.frame.id);
+      current.compatibility.frameNavigated(frame.id);
     }
     if (event.method === "Page.frameDetached" && event.params.frameId) {
+      current.markFrameContexts = current.markFrameContexts.filter((entry) => entry.frameId !== event.params.frameId);
       current.compatibility.frameDetached(event.params.frameId);
     }
     if (event.method === "Page.navigatedWithinDocument" && event.params.frameId === current.mainFrameId) {
@@ -7269,6 +8940,112 @@ var createBrowserRuntime = ({
     removeTab(targetId);
     return targetId;
   };
+  const createMarkContext = async (current, frameId) => {
+    const world = await cdp.sendSession(current.sessionId, "Page.createIsolatedWorld", {
+      frameId,
+      worldName: MARK_WORLD
+    });
+    const contextId2 = world.executionContextId;
+    if (!Number.isInteger(contextId2)) throw new Error("Chrome returned no isolated world for marking");
+    await installMark(pageOf(current), contextId2);
+    return { frameId, contextId: contextId2 };
+  };
+  runtime.startMark = async (session) => {
+    await runtime.ensurePage();
+    const current = activeTab();
+    if (!current) throw new Error("This chat has no browser tab to mark");
+    if (current.markActive) await cancelMarkMode();
+    current.markError = null;
+    const resolver = createMarkCdp({
+      cdp,
+      sessionId: current.sessionId,
+      frameId: current.mainFrameId,
+      url: current.url,
+      title: current.title
+    });
+    try {
+      const mainContext = await createMarkContext(current, current.mainFrameId);
+      current.markCdp = resolver;
+      current.markContextId = mainContext.contextId;
+      current.markFrameContexts = [mainContext];
+      current.markActive = true;
+      current.markReady = true;
+      current.markSession = typeof session === "string" ? session : null;
+    } catch (error) {
+      await resolver.close();
+      resetMarkState(current);
+      current.markError = error instanceof Error ? error.message : "Could not start marking";
+      throw error;
+    }
+  };
+  runtime.cancelMark = cancelMarkMode;
+  runtime.deleteMark = (id) => {
+    const current = activeTab();
+    if (!current || typeof id !== "string") return;
+    current.marks = current.marks.filter((mark) => mark.id !== id);
+  };
+  runtime.clearMarks = async () => {
+    const current = activeTab();
+    if (!current) return;
+    if (current.markActive) await cancelMarkMode();
+    current.marks = [];
+  };
+  runtime.resolveMarks = async () => {
+    const current = activeTab();
+    if (!current) return [];
+    return resolveMarksFor(current);
+  };
+  runtime.snapshotMarks = async (page) => {
+    const current = tabs.get(page.targetId);
+    if (!current) return [];
+    return resolveMarksFor(current);
+  };
+  runtime.handleMarkInput = async (event, page) => {
+    const current = activeTab();
+    if (!current) return false;
+    if (event.type === "pointer" && event.action === "up" && current.markSwallowPointerUp) {
+      current.markSwallowPointerUp = false;
+      return true;
+    }
+    if (event.type === "key" && event.action === "up" && current.markSwallowKeyUp) {
+      current.markSwallowKeyUp = false;
+      return true;
+    }
+    if (!current.markActive) return false;
+    if (event.type === "pointer") {
+      if (event.action === "down" && event.button === 0) {
+        const contexts = current.markFrameContexts.slice();
+        const resolver = current.markCdp;
+        const contextId2 = current.markContextId;
+        if (contextId2 !== null) void hideMarkOverlay(pageOf(current), contextId2);
+        let payload = null;
+        if (resolver) {
+          payload = await resolver.describeAt({ x: event.x, y: event.y }).catch(() => null);
+        }
+        resetMarkState(current);
+        current.markSwallowPointerUp = true;
+        if (payload) addMark(current, payload);
+        void cancelMarkContexts(current, contexts);
+        return true;
+      }
+      if (event.action === "down" && event.button === 2) {
+        await cancelMarkMode();
+        current.markSwallowPointerUp = true;
+        return true;
+      }
+      return true;
+    }
+    if (event.type === "key") {
+      if (event.key === "Escape") {
+        await cancelMarkMode();
+        current.markSwallowKeyUp = true;
+        return true;
+      }
+      return true;
+    }
+    if (event.type === "wheel") return false;
+    return true;
+  };
   runtime.setNativeSelectCompatibility = async (enabled) => {
     await runtime.ensurePage();
     const active = activeTab();
@@ -7305,6 +9082,7 @@ var createBrowserRuntime = ({
   runtime.command = async (name, parameters = {}) => {
     if (closed) throw new Error("Browser runtime is closed");
     await contextMenu.close();
+    await cancelMarkMode();
     if (name === "tab-new") {
       await openTab();
       return;
@@ -7348,17 +9126,18 @@ var createBrowserRuntime = ({
     await refreshNavigation(current);
   };
   const execute = createBrowserActions(runtime);
-  const surface = createSurface(runtime);
+  const surfaceController = createSurface(runtime, surface);
   let copyRequest = null;
+  let cutRequest = null;
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
-    readSelection: () => surface.clipboard(),
+    readSelection: () => surfaceController.clipboard(),
     onAction: (action, selection) => {
       if (action === "back" || action === "forward" || action === "reload") {
         void runtime.command(action).catch(() => {
         });
       } else if (action === "copy") {
-        copyRequest = { id: crypto3.randomUUID(), text: selection.length > GUEST_CLIPBOARD_TEXT_MAX ? null : selection, at: Date.now() };
+        copyRequest = { id: crypto5.randomUUID(), text: selection.length > GUEST_CLIPBOARD_TEXT_MAX ? null : selection, at: Date.now() };
       }
     }
   });
@@ -7381,6 +9160,9 @@ var createBrowserRuntime = ({
       if (runtime.controller === "user") {
         throw new Error("The user controls the browser. Wait for them to hand control back.");
       }
+      if (activeTab()?.markActive) {
+        throw new Error("The user is marking an element. Wait for them to finish.");
+      }
       await contextMenu.close();
       runtime.agentActive = true;
       try {
@@ -7394,11 +9176,18 @@ var createBrowserRuntime = ({
     actionQueue = operation;
     return operation;
   };
-  runtime.surfaceFrame = (request) => surface.frame(request);
-  runtime.surfaceInput = (events, theme) => surface.input(events, theme);
-  runtime.surfaceControl = (controller) => surface.control(controller);
-  runtime.surfaceResize = (size) => surface.resize(size);
-  runtime.surfaceClipboard = () => surface.clipboard();
+  runtime.surfaceFrame = (request) => surfaceController.frame(request);
+  runtime.surfaceInput = (events, theme) => surfaceController.input(events, theme);
+  runtime.surfaceControl = (controller) => surfaceController.control(controller);
+  runtime.surfaceResize = (size) => surfaceController.resize(size);
+  runtime.surfaceClipboard = () => surfaceController.clipboard();
+  runtime.offerCutClipboard = (text2) => {
+    cutRequest = { id: crypto5.randomUUID(), text: text2.slice(0, GUEST_CLIPBOARD_TEXT_MAX), at: Date.now() };
+    return cutRequest.id;
+  };
+  runtime.clearCutClipboard = (id) => {
+    if (cutRequest?.id === id) cutRequest = null;
+  };
   runtime.onDead = (listener) => {
     deathListeners.add(listener);
     return () => deathListeners.delete(listener);
@@ -7413,7 +9202,7 @@ var createBrowserRuntime = ({
     shutdownController.abort(new DOMException("Browser runtime stopped", "AbortError"));
     await chrome.close();
     cdp?.close();
-    await surface.close();
+    await surfaceController.close();
     inspector.close();
     await pagePromise?.catch(() => {
     });
@@ -7432,7 +9221,7 @@ var createBrowserRuntime = ({
 
 // src/dev-servers.js
 import { spawn as spawnProcess } from "node:child_process";
-import fs3 from "node:fs/promises";
+import fs4 from "node:fs/promises";
 var SCAN_TIMEOUT_MS = 2500;
 var CACHE_TTL_MS = 3e3;
 var IGNORED_PORTS = /* @__PURE__ */ new Set([22, 53, 445, 631, 3306, 5432, 6379, 9229, 27017]);
@@ -7544,7 +9333,7 @@ var runCommand = (spawn2, command, args) => new Promise((resolve) => {
 var createDevServerScanner = ({
   platform = process.platform,
   spawn: spawn2 = spawnProcess,
-  files = fs3,
+  files = fs4,
   selfPid = process.pid,
   hostPid = process.ppid,
   now = Date.now
@@ -7592,8 +9381,8 @@ var createDevServerScanner = ({
       return devServerGrants(listeners, (listener) => listener.pid === null || excluded.has(listener.pid));
     }
     if (platform !== "linux") return [];
-    const tables = await Promise.all([["/proc/net/tcp", 4], ["/proc/net/tcp6", 6]].map(async ([path4, family]) => {
-      const table = await files.readFile(path4, "utf8").catch(() => null);
+    const tables = await Promise.all([["/proc/net/tcp", 4], ["/proc/net/tcp6", 6]].map(async ([path6, family]) => {
+      const table = await files.readFile(path6, "utf8").catch(() => null);
       return table === null ? null : parseProcListeners(table, family);
     }));
     if (tables.every((table) => table === null)) return [];
@@ -7614,7 +9403,7 @@ var createDevServerScanner = ({
 };
 
 // src/service.js
-import crypto4 from "node:crypto";
+import crypto6 from "node:crypto";
 import http2 from "node:http";
 import net3 from "node:net";
 var BODY_MAX_BYTES = 17 * 1024 * 1024;
@@ -7635,7 +9424,7 @@ var authorized = (request, token) => {
   if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
   const provided = Buffer.from(header.slice(7));
   const expected = Buffer.from(token);
-  return provided.length === expected.length && crypto4.timingSafeEqual(provided, expected);
+  return provided.length === expected.length && crypto6.timingSafeEqual(provided, expected);
 };
 var withScheme = (address) => {
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(address)) return address;
@@ -7800,6 +9589,41 @@ var createService = ({ runtime, token, port = 0 }) => {
       if (!id || generation === null) return text(response, 400, "scopeId and generation are required\n");
       try {
         await runtime.selectScope(id, generation, access);
+        return json(response, 200, runtime.state(access));
+      } catch (error) {
+        return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
+      }
+    }
+    const markOperation = request.method === "POST" ? /^\/browser\/mark\/(start|cancel|delete|clear|resolve)$/.exec(url.pathname)?.[1] : null;
+    if (markOperation) {
+      const body = await readObjectBody(request);
+      const generation = generationProperty(body);
+      const session = stringProperty(body, "session");
+      const id = stringProperty(body, "id");
+      if (markOperation !== "resolve" && generation === null) {
+        return text(response, 400, "generation is required\n");
+      }
+      if ((markOperation === "start" || markOperation === "cancel") && !session) {
+        return text(response, 400, "session is required\n");
+      }
+      if (markOperation === "delete" && !id) return text(response, 400, "id is required\n");
+      try {
+        if (markOperation === "start") await runtime.startMark(session, generation, access);
+        else if (markOperation === "cancel") await runtime.cancelMark(session, generation, access);
+        else if (markOperation === "delete") await runtime.deleteMark(id, generation, access);
+        else if (markOperation === "clear") await runtime.clearMarks(generation, access);
+        else await runtime.resolveMarks();
+        return json(response, 200, runtime.state(access));
+      } catch (error) {
+        return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/browser/cut/ack") {
+      const body = await readObjectBody(request);
+      const id = stringProperty(body, "id");
+      if (!id) return text(response, 400, "id is required\n");
+      try {
+        await runtime.ackCut(id);
         return json(response, 200, runtime.state(access));
       } catch (error) {
         return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
@@ -8025,7 +9849,7 @@ var startService = async ({
   const config = loadConfig({ entryUrl: import.meta.url, configPath });
   const devServers = config.discoverDevServers ? createDevServerScanner() : null;
   const browserRuntime = runtime ?? createBrowserManager({
-    createRuntime: () => createBrowserRuntime({ ...config, devServers })
+    createRuntime: (context) => createBrowserRuntime({ ...config, devServers, scope: context })
   });
   const service = createService({
     runtime: browserRuntime,
@@ -8035,7 +9859,7 @@ var startService = async ({
   await service.listen();
   return service;
 };
-var isMain = process.argv[1] && path3.resolve(process.argv[1]) === fileURLToPath2(import.meta.url);
+var isMain = process.argv[1] && path5.resolve(process.argv[1]) === fileURLToPath2(import.meta.url);
 if (isMain) {
   startService().then((service) => {
     let stopping = false;

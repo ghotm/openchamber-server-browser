@@ -283,6 +283,18 @@ export const createService = ({ runtime, token, port = 0 }) => {
       }
     }
 
+    if (request.method === 'POST' && url.pathname === '/browser/cut/ack') {
+      const body = await readObjectBody(request);
+      const id = stringProperty(body, 'id');
+      if (!id) return text(response, 400, 'id is required\n');
+      try {
+        await runtime.ackCut(id);
+        return json(response, 200, runtime.state(access));
+      } catch (error) {
+        return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
+      }
+    }
+
     if (request.method === 'POST' && url.pathname === '/browser/navigate') {
       const body = await readObjectBody(request);
       const target = stringProperty(body, 'url');

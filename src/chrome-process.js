@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { connectCdp } from './cdp-client.js';
+import { recoverProfile } from './profile-lock.js';
 
 const MINIMUM_CHROME_MAJOR_VERSION = 109;
 const SYSTEM_NAMES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
@@ -117,7 +118,22 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
   let persistentProfile = false;
   let result = null;
   let closed = false;
+  let lease = null;
+  let stderrHead = '';
+  let stderrTail = '';
   const exitListeners = new Set();
+
+  const stderrSummary = () => {
+    const combined = stderrHead && stderrTail && !stderrHead.includes(stderrTail)
+      ? `${stderrHead}\n${stderrTail}`
+      : stderrHead || stderrTail;
+    const sanitized = combined
+      .replace(/https?:\/\/\S+/gi, '<url>')
+      .replace(/\b(token|key|password|secret)\s*=\s*[^\s&]+/gi, '$1=<redacted>')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return sanitized.slice(0, 4_096);
+  };
 
   const removeProfile = async () => {
     if (!profileDir || persistentProfile) return;
@@ -132,6 +148,18 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       try { process.kill(-child.pid, 'SIGKILL'); } catch {}
     }
     try { child.kill('SIGKILL'); } catch {}
+  };
+
+  const handleLeaseLost = (error) => {
+    if (closed) return;
+    const current = lease;
+    lease = null;
+    // The lease is the only proof that this profile is ours. If its heartbeat
+    // cannot be maintained, stop Chrome before another service can take over.
+    result = null;
+    killChild();
+    for (const listener of exitListeners) listener({ code: null, signal: 'lease-lost', error });
+    if (current) void current.release().catch(() => {});
   };
 
   const waitForExit = (processToWait) => {
@@ -163,6 +191,9 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       persistentProfile = true;
       await fs.promises.mkdir(profileDir, { recursive: true, mode: 0o700 });
       await fs.promises.chmod(profileDir, 0o700);
+      lease = await recoverProfile(profileDir, {
+        onLost: (error) => handleLeaseLost(error),
+      });
       // A previous shutdown leaves the old port here; reading it before this
       // Chrome rewrites it would connect to a dead endpoint.
       await fs.promises.rm(path.join(profileDir, 'DevToolsActivePort'), { force: true });
@@ -172,6 +203,8 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
     }
     const userAgent = await userAgentArgs(binary);
     if (closed) throw new Error('Chrome launch was cancelled');
+    stderrHead = '';
+    stderrTail = '';
     child = spawn(binary, [
       '--headless=new',
       // Headless mode sets navigator.webdriver, which Google sign-in also refuses.
@@ -190,16 +223,25 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       'about:blank',
     ], {
       env: { ...process.env },
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: ['ignore', 'ignore', 'pipe'],
       detached: process.platform !== 'win32',
       windowsHide: true,
+    });
+    child.stderr?.on('data', (chunk) => {
+      const text = String(chunk);
+      if (stderrHead.length < 2_048) stderrHead += text.slice(0, 2_048 - stderrHead.length);
+      stderrTail = (stderrTail + text).slice(-3_072);
     });
     let exitError = null;
     child.once('error', (error) => { exitError = new Error(`Chrome failed to spawn: ${error.message}`); });
     child.once('exit', (code, signal) => {
       if (closed) return;
-      if (!result) exitError = new Error(`Chrome exited during startup (code ${code ?? 'null'}, signal ${signal ?? 'none'})`);
-      else for (const listener of exitListeners) listener({ code, signal });
+      if (!result) {
+        const details = stderrSummary();
+        exitError = new Error(`Chrome exited during startup (code ${code ?? 'null'}, signal ${signal ?? 'none'})${details ? `\n${details}` : ''}`);
+      } else {
+        for (const listener of exitListeners) listener({ code, signal });
+      }
     });
 
     const deadline = Date.now() + startupTimeoutMs;
@@ -228,7 +270,20 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
         launchPromise = launch().catch(async (error) => {
           killChild();
           await removeProfile();
+          const current = lease;
+          lease = null;
+          if (current) {
+            try {
+              await current.release();
+            } catch (releaseError) {
+              const combined = new Error(`${error.message}\nThe profile lease at ${current.leaseDir} could not be released: ${releaseError.message}. Remove it before retrying.`);
+              combined.cause = error;
+              throw combined;
+            }
+          }
           throw error;
+        }).finally(() => {
+          launchPromise = null;
         });
       }
       return launchPromise;
@@ -248,9 +303,15 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       await launchPromise?.catch(() => {});
       await exited;
       await removeProfile();
-      profileDir = null;
-      child = null;
-      result = null;
+      const current = lease;
+      lease = null;
+      try {
+        await current?.release();
+      } finally {
+        profileDir = null;
+        child = null;
+        result = null;
+      }
     },
     onExit(listener) {
       exitListeners.add(listener);

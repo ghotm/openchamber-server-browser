@@ -243,6 +243,7 @@ export const createBrowserManager = ({
         generation: viewGeneration,
         notice: notice ? { ...notice } : null,
         copy: selected()?.runtime.copyRequest ?? null,
+        cut: selected()?.runtime.cutRequest ?? null,
         mark: selected()?.runtime.markState ?? { active: false, ready: false, session: null, error: null, marks: [] },
         // The visible tab's errors and warnings, only for a dock whose console is open.
         ...(problems ? { consoleProblems: selected()?.runtime.consoleProblems?.() ?? [] } : {}),
@@ -361,6 +362,13 @@ export const createBrowserManager = ({
         const entry = requireSelected();
         touch(entry);
         return entry.runtime.resolveMarks();
+      });
+    },
+    ackCut(id) {
+      return enqueue(async () => {
+        const entry = requireSelected();
+        touch(entry);
+        entry.runtime.clearCutClipboard(id);
       });
     },
     setViewport({ mode, width, height, mobile }, expectedGeneration, access) {

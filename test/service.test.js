@@ -56,6 +56,7 @@ const createRuntime = () => {
     async surfaceControl(controller) { calls.push(['control', controller]); },
     async surfaceResize(size) { calls.push(['resize', size]); return size; },
     async surfaceClipboard() { calls.push(['clipboard']); return 'copied'; },
+    async ackCut(id) { calls.push(['cut-ack', id]); },
     async close() { calls.push(['close']); },
   };
 };
@@ -303,6 +304,22 @@ test('answers no content when nothing was copied so the viewer keeps its clipboa
 
   assert.equal(clipboard.status, 204);
   assert.equal(await clipboard.text(), '');
+});
+
+test('acknowledges the cut clipboard once the dock writes it', async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.service.close());
+
+  const missing = await fetch(`${fixture.origin}/browser/cut/ack`, {
+    method: 'POST', headers: authorization, body: JSON.stringify({}),
+  });
+  const accepted = await fetch(`${fixture.origin}/browser/cut/ack`, {
+    method: 'POST', headers: authorization, body: JSON.stringify({ id: 'cut-1' }),
+  });
+
+  assert.equal(missing.status, 400);
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(fixture.runtime.calls, [['cut-ack', 'cut-1']]);
 });
 
 test('dock tab routes validate their fields and reach the manager', async (context) => {

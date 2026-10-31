@@ -762,6 +762,15 @@ const offerCopy = (copy) => {
   void host.toast(toast).catch(() => {});
 };
 
+let lastCutId = null;
+const offerCut = (cut) => {
+  if (!cut || cut.id === lastCutId) return;
+  lastCutId = cut.id;
+  void host.writeClipboard(cut.text)
+    .then(() => request('/browser/cut/ack', { id: cut.id }))
+    .catch(() => { lastCutId = null; });
+};
+
 const refresh = async () => {
   if (refreshPending || requestPending) return;
   refreshPending = true;
@@ -774,6 +783,7 @@ const refresh = async () => {
       serviceError = null;
       syncViewer();
       offerCopy(state.copy);
+      offerCut(state.cut);
       followChat();
       render();
     }
