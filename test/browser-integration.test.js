@@ -68,6 +68,51 @@ const startWebFixture = async ({ frameOrigin = '' } = {}) => {
       `, 'Select compatibility'));
       return;
     }
+    if (request.url === '/form') {
+      response.end(html(`
+        <section id="dialog"><p>Inside the dialog</p>
+          <select id="country" aria-label="Country">
+            <option value="">Choose</option>
+            <option value="ca">  Canada
+              (CA) </option>
+            <option value="us" label="United States">US</option>
+            <option value="mx" disabled>Mexico</option>
+            <optgroup label="Closed" disabled><option value="xx">Nowhere</option></optgroup>
+            <option value="t1">Twin</option>
+            <option value="t2">Twin</option>
+          </select>
+        </section>
+        <p>Outside the dialog</p>
+        <select id="many" multiple><option>A</option></select>
+        <select id="long"></select>
+        <button id="custom" role="combobox">Custom</button>
+        <script>
+          window.changes = 0;
+          document.querySelector('#country').addEventListener('change', () => { window.changes += 1; });
+          const long = document.querySelector('#long');
+          for (let i = 0; i < 40; i += 1) long.add(new Option(i === 0 ? 'x'.repeat(100) : 'Option ' + i, String(i)));
+        </script>
+      `, 'Form'));
+      return;
+    }
+    if (request.url === '/splash') {
+      response.end(html(`
+        <h1 id="status">Loading splash</h1>
+        <script>
+          addEventListener('load', () => setTimeout(() => fetch('/api/chunk').then(() => {
+            document.querySelector('#status').textContent = 'App ready';
+          }), 300));
+        </script>
+      `, 'Splash'));
+      return;
+    }
+    if (request.url === '/busy') {
+      response.end(html(`
+        <output id="ticks">0</output>
+        <script>setInterval(() => { const t = document.querySelector('#ticks'); t.textContent = String(Number(t.textContent) + 1); }, 100);</script>
+      `, 'Busy'));
+      return;
+    }
     if (request.url === '/next') {
       response.end(html('<h1>Next page</h1><a href="/">Home</a>', 'Next'));
       return;
@@ -107,6 +152,11 @@ const startWebFixture = async ({ frameOrigin = '' } = {}) => {
         <a id="surface" href="/next" target="_blank">Open next</a>
         <button id="mark" onclick="window.open('/next', 'popup')">Open popup</button>
       `, 'Tabs'));
+      return;
+    }
+    if (request.url === '/headers') {
+      const sent = { userAgent: request.headers['user-agent'], hints: request.headers['sec-ch-ua'] ?? null };
+      response.end(html(`<pre id="headers">${JSON.stringify(sent)}</pre>`, 'Headers'));
       return;
     }
     if (request.url === '/title') {
@@ -291,6 +341,30 @@ test('keeps a configured Chrome profile across shutdown and relaunch', { skip: c
     await second.close();
   }
   assert.equal(fs.existsSync(profileDir), true);
+});
+
+test('presents itself as regular Chrome, which Google sign-in requires', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page that shows the headers its request came with.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+
+  // When the browser opens it.
+  await runtime.perform('browser.open', { url: `${web.origin}/headers` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+  })).result.value;
+
+  // Then neither the request nor the page says the browser is headless or automated, and the client hints stay.
+  const sent = JSON.parse(await evaluate('document.querySelector("#headers").textContent'));
+  assert.match(sent.userAgent, / Chrome\/\d+\.0\.0\.0 /);
+  assert.doesNotMatch(sent.userAgent, /Headless/);
+  assert.match(sent.hints ?? '', /Chromium/);
+  assert.equal(await evaluate('navigator.userAgent'), sent.userAgent);
+  assert.equal(await evaluate('navigator.webdriver'), false);
 });
 
 test('stops Chrome at once on close even when its page no longer answers', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
@@ -573,10 +647,12 @@ test('follows pages the site opens as tabs and returns to the opener when they c
     { type: 'pointer', action: 'up', x, y, button: 0, buttons: 0, modifiers },
   ]);
 
-  // When the user follows the link, then the new page becomes the active tab and the agent works there.
+  // When the user follows the link, then the new page becomes the active tab, and the agent stays in its own until it names the new one.
   await click(30, 30);
   await waitFor(() => runtime.tabs.length === 2 && runtime.url === `${web.origin}/next`);
-  assert.equal((await runtime.perform('browser.snapshot', {})).title, 'Next');
+  assert.equal((await runtime.perform('browser.snapshot', {})).title, 'Tabs');
+  const followed = runtime.tabs.find((tab) => tab.active).id;
+  assert.equal((await runtime.perform('browser.snapshot', { tabId: followed })).title, 'Next');
 
   // When that tab closes, then its opener comes back.
   await runtime.command('tab-close', { tabId: runtime.tabs.find((tab) => tab.active).id });
@@ -586,12 +662,14 @@ test('follows pages the site opens as tabs and returns to the opener when they c
   await click(30, 128);
   await waitFor(() => runtime.tabs.length === 2 && runtime.url === `${web.origin}/next`);
 
-  // When the dock opens a blank tab and then selects the opener, then the agent follows the selection.
+  // When the dock opens a blank tab and selects the opener again, then the viewer follows the dock, and the
+  // agent, whose last tab closed, works in the newest tab it opened.
   await runtime.command('tab-new');
   assert.equal(runtime.tabs.length, 3);
   assert.equal(runtime.url, 'about:blank');
-  await runtime.command('tab-select', { tabId: opener });
   assert.equal((await runtime.perform('browser.snapshot', {})).title, 'Tabs');
+  await runtime.command('tab-select', { tabId: opener });
+  assert.equal(runtime.url, `${web.origin}/tabs`);
 });
 
 test('lets the agent name tabs by id without moving the viewer off its tab', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
@@ -606,12 +684,13 @@ test('lets the agent name tabs by id without moving the viewer off its tab', { s
   const before = await runtime.surfaceFrame({ after: 0, wait: 10_000 });
   assert.ok(before, 'the viewer got no frame of its page');
 
-  // When the agent opens another page, then it gets a background tab and the viewer stays put.
+  // When the agent opens another page, then it gets a background tab, the viewer stays put, and actions
+  // without a tab id follow the agent there.
   const opened = await runtime.perform('browser.open', { url: `${web.origin}/` });
   assert.notEqual(opened.tabId, shown);
   assert.equal(opened.title, 'Fixture');
   const snapshot = await runtime.perform('browser.snapshot', {});
-  assert.equal(snapshot.title, 'Next');
+  assert.equal(snapshot.title, 'Fixture');
   assert.deepEqual(snapshot.tabs, [
     { id: shown, title: 'Next', url: `${web.origin}/next`, active: true },
     { id: opened.tabId, title: 'Fixture', url: `${web.origin}/`, active: false },
@@ -633,6 +712,10 @@ test('lets the agent name tabs by id without moving the viewer off its tab', { s
   assert.equal(runtime.url, `${web.origin}/next`);
   assert.equal(runtime.tabs.find((tab) => tab.active).id, shown);
 
+  // When the agent names the viewer's tab, then its later actions without an id stay there.
+  await runtime.perform('browser.snapshot', { tabId: shown });
+  assert.equal((await runtime.perform('browser.snapshot', {})).title, 'Next');
+
   // When an id is not one this browser issued, then the action is refused instead of running elsewhere.
   await assert.rejects(runtime.perform('browser.click', { tabId: 'missing', selector: '#mark' }), /no tab "missing"/);
 
@@ -643,6 +726,106 @@ test('lets the agent name tabs by id without moving the viewer off its tab', { s
   const next = runtime.surfaceFrame({ after: before.sequence, wait: 10_000 });
   await evaluate('document.body.style.background = "rgb(10, 120, 200)"');
   assert.ok(await next, 'the viewer stopped getting frames of its page');
+});
+
+test('closes only the tabs the agent opened, newest first', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given the agent's first page, a tab the viewer opened and navigated, and the agent's background tab.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  const first = await runtime.perform('browser.open', { url: `${web.origin}/next` });
+  await runtime.command('tab-new');
+  await runtime.command('navigate', { url: `${web.origin}/title` });
+  await waitFor(() => runtime.url === `${web.origin}/title` && runtime.canGoBack);
+  const viewerTab = runtime.tabs.find((tab) => tab.active).id;
+  const background = await runtime.perform('browser.open', { url: `${web.origin}/` });
+
+  // When the agent names the viewer's tab or one that does not exist, then nothing closes.
+  await assert.rejects(runtime.perform('browser.close', { tabId: viewerTab }), /not opened by the agent/);
+  await assert.rejects(runtime.perform('browser.close', { tabId: 'missing' }), /no tab "missing"/);
+  assert.equal(runtime.tabs.length, 3);
+
+  // When it closes without a tab id, then its newest tab goes first, then its older one.
+  assert.deepEqual(await runtime.perform('browser.close', {}), { closed: true, tabId: background.tabId });
+  assert.deepEqual(await runtime.perform('browser.close', {}), { closed: true, tabId: first.tabId });
+  await assert.rejects(runtime.perform('browser.close', {}), /no tab of its own/);
+
+  // Then the viewer's tab is the one left, still in front.
+  assert.deepEqual(runtime.tabs.map((tab) => [tab.id, tab.active]), [[viewerTab, true]]);
+});
+
+test('selects native options by exact label or value and lists them in a scoped snapshot', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page with a native select inside a dialog, a multiple select, a long select, and a custom control.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/form` });
+  const page = await runtime.ensurePage();
+  const evaluate = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+
+  // When the agent reads the page, then each select lists its options, capped and flagged when cut.
+  const snapshot = await runtime.perform('browser.snapshot', {});
+  const country = snapshot.elements.find((element) => element.selector === '#country');
+  const long = snapshot.elements.find((element) => element.selector === '#long');
+  assert.equal(country.multiple, false);
+  assert.deepEqual(country.options.slice(1, 5), [
+    { label: 'Canada (CA)', value: 'ca', selected: false, disabled: false },
+    { label: 'United States', value: 'us', selected: false, disabled: false },
+    { label: 'Mexico', value: 'mx', selected: false, disabled: true },
+    { label: 'Nowhere', value: 'xx', selected: false, disabled: true },
+  ]);
+  assert.equal(country.optionsTruncated, undefined);
+  assert.equal(snapshot.elements.find((element) => element.selector === '#many').multiple, true);
+  assert.equal(long.options.length, 32);
+  assert.equal(long.options[0].label.length, 80);
+  assert.equal(long.optionsTruncated, true);
+
+  // When the snapshot is scoped, then its text comes from that element alone.
+  const scoped = await runtime.perform('browser.snapshot', { selector: '#dialog' });
+  assert.match(scoped.text, /Inside the dialog/);
+  assert.doesNotMatch(scoped.text, /Outside the dialog/);
+
+  // When it selects by label and then by value, then the page sees each change.
+  assert.deepEqual(await runtime.perform('browser.select', { selector: '#country', label: 'Canada (CA)' }), {
+    selector: '#country', label: 'Canada (CA)', value: 'ca', url: `${web.origin}/form`,
+  });
+  assert.equal((await runtime.perform('browser.select', { selector: '#country', value: 'us' })).label, 'United States');
+  assert.equal(await evaluate('window.changes'), 2);
+
+  // When a request is ambiguous, disabled, missing, or for another kind of control, then the page is left as it was.
+  const refusals = [
+    [{ selector: '#country', label: 'Twin' }, /More than one option/],
+    [{ selector: '#country', value: 'mx' }, /disabled/],
+    [{ selector: '#country', value: 'xx' }, /disabled/],
+    [{ selector: '#country', label: 'Atlantis' }, /No option/],
+    [{ selector: '#country', label: 'US', value: 'us' }, /exactly one of label or value/],
+    [{ selector: '#many', label: 'A' }, /Multiple selects/],
+    [{ selector: '#custom', label: 'Custom' }, /not a native HTML select/],
+  ];
+  for (const [parameters, error] of refusals) await assert.rejects(runtime.perform('browser.select', parameters), error);
+  assert.equal(await evaluate('document.querySelector("#country").value'), 'us');
+  assert.equal(await evaluate('window.changes'), 2);
+});
+
+test('reports a page as settled only once it stops changing after its load', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given an app that replaces its splash after a lazy fetch, and a page that never stops ticking.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+
+  // When the agent opens the app, then the answer waits for it and a snapshot right after shows it.
+  const app = await runtime.perform('browser.open', { url: `${web.origin}/splash` });
+  assert.equal(app.settled, true);
+  assert.match((await runtime.perform('browser.snapshot', {})).text, /App ready/);
+
+  // When the page keeps changing, then the open gives up waiting and says it has not settled.
+  const started = Date.now();
+  const busy = await runtime.perform('browser.open', { url: `${web.origin}/busy`, tabId: app.tabId });
+  assert.equal(busy.settled, false);
+  assert.ok(Date.now() - started < 8_000, `opening took ${Date.now() - started} ms`);
 });
 
 test('streams frames when the viewer\'s first frame request opens the page', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {

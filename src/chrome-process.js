@@ -1,11 +1,20 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { connectCdp } from './cdp-client.js';
 
 const MINIMUM_CHROME_MAJOR_VERSION = 109;
 const SYSTEM_NAMES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+// The platform part of Chrome's reduced User-Agent is frozen per OS.
+const USER_AGENT_PLATFORMS = Object.freeze({
+  darwin: 'Macintosh; Intel Mac OS X 10_15_7',
+  linux: 'X11; Linux x86_64',
+  win32: 'Windows NT 10.0; Win64; x64',
+});
+const VERSION_RESOURCE_KEY = Buffer.from('VS_VERSION_INFO\0', 'utf16le');
+const FIXED_FILE_INFO_SIGNATURE = 0xfeef04bd;
 
 const executable = (candidate) => {
   try {
@@ -48,6 +57,42 @@ const parseEndpoint = (contents) => {
 };
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+// Headless Chrome calls itself HeadlessChrome, and Google then refuses sign-in
+// ("This browser or app may not be secure"). The flag, unlike a per-page
+// override, also covers popups and workers and keeps the Sec-CH-UA hints.
+// In a VS_VERSIONINFO resource, VS_FIXEDFILEINFO starts 34 bytes after the key,
+// and the major version is the high word of its dwFileVersionMS.
+export const windowsChromeMajor = (image) => {
+  for (let key = image.indexOf(VERSION_RESOURCE_KEY); key >= 0; key = image.indexOf(VERSION_RESOURCE_KEY, key + 1)) {
+    const fixed = key + 34;
+    if (fixed + 12 <= image.length && image.readUInt32LE(fixed) === FIXED_FILE_INFO_SIGNATURE) {
+      return image.readUInt16LE(fixed + 10);
+    }
+  }
+  return null;
+};
+
+// Chrome 156 handles --version only on POSIX: chrome.exe ignores it and opens a
+// normal browser window, so on Windows the version comes from the executable.
+const chromeMajorVersion = async (binary) => {
+  if (process.platform === 'win32') return windowsChromeMajor(await fs.promises.readFile(binary));
+  const { stdout } = await promisify(execFile)(binary, ['--version'], { timeout: 5_000 });
+  return Number.parseInt(stdout.match(/(\d+)\.\d+\.\d+\.\d+/)?.[1] ?? '', 10);
+};
+
+const userAgentArgs = async (binary) => {
+  const platform = USER_AGENT_PLATFORMS[process.platform];
+  if (!platform) return [];
+  try {
+    const major = await chromeMajorVersion(binary);
+    // Also rejects a launcher shim's own version standing in for Chrome's.
+    if (!(major >= MINIMUM_CHROME_MAJOR_VERSION)) return [];
+    return [`--user-agent=Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`];
+  } catch {
+    return [];
+  }
+};
 
 const probeVersion = async (endpoint) => {
   const cdp = await connectCdp(endpoint, { commandTimeoutMs: 5_000 });
@@ -125,9 +170,13 @@ export const createChromeProcess = ({ chromePath = null, startupTimeoutMs = 15_0
       profileDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'openchamber-server-browser-'));
       await fs.promises.chmod(profileDir, 0o700);
     }
+    const userAgent = await userAgentArgs(binary);
     if (closed) throw new Error('Chrome launch was cancelled');
     child = spawn(binary, [
       '--headless=new',
+      // Headless mode sets navigator.webdriver, which Google sign-in also refuses.
+      '--disable-blink-features=AutomationControlled',
+      ...userAgent,
       '--webrtc-ip-handling-policy=disable_non_proxied_udp',
       '--remote-debugging-port=0',
       '--remote-debugging-address=127.0.0.1',
