@@ -32,6 +32,9 @@ The bundles are committed, because Git installations use them as they are. Rebui
 | `src/surface.js` | Screencast frames and viewer input |
 | `src/browser-actions.js` | The agent's `browser.*` actions |
 | `src/chrome-process.js` | Launching Chrome: executable, profile, User-Agent |
+| `src/profile-lock.js` | The persistent-profile lease and stale lock recovery |
+| `src/mark.js`, `src/mark-cdp.js` | Element marking: the page overlay and CDP lookup through frames and shadow roots |
+| `src/input-events.js` | Turning viewer input into page input |
 | `src/context-menu.js` | The viewer menu drawn inside pages |
 | `src/devtools.js` | The DevTools relay and frontend target |
 | `src/devtools-policy.js` | What DevTools may send and receive |
@@ -48,8 +51,9 @@ The automated suite runs real Chrome where it can.
 | Covers | Checks |
 | --- | --- |
 | The service | Authentication and protocol validation, private-address policy, origin grants and discovery, and cancellation. |
-| Browser actions and shared input | Every action and shared input against real pages: keyboard layouts, dragging, multi-click selection, copying, the viewer menu, tabs and popups, loading state, viewports at the viewer's pixel ratio, and crash recovery. |
-| Scopes and guards | Temporary-profile cleanup, scope isolation, fail-closed unknown context, stale-frame and generation guards, and the scope bound. |
+| Browser actions and shared input | Every action and shared input against real pages: keyboard layouts, dragging, multi-click selection, copying and cutting, the viewer menu, tabs and popups, loading state, viewports at the viewer's pixel ratio, native selects, and crash recovery. |
+| Marking | Marked elements through `browser.snapshot`, including same-origin and cross-origin iframes, native selects, and stale selectors. |
+| Scopes and guards | Temporary and persistent profile cleanup, the profile lease and its recovery, scope isolation, fail-closed unknown context, stale-frame and generation guards, and the scope bound. |
 | Inspection | The inspector, and DevTools through their relay and policy. |
 
 Each [release](https://github.com/JosueGalRe/openchamber-server-browser/releases) records the automated and manual checks behind it. Those include the hosts, platforms, and Chrome versions used, and what was not run.

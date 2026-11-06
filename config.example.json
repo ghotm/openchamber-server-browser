@@ -1,6 +1,7 @@
 {
   "allowedOrigins": ["http://127.0.0.1:3000", "http://localhost:3000"],
   "discoverDevServers": false,
+  "profileRoot": null,
   "surface": {
     "quality": 72,
     "everyNthFrame": 1

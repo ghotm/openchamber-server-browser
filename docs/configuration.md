@@ -77,3 +77,36 @@ The service looks for Chrome or Chromium 109 or newer in standard locations. If 
 ```
 
 Use a full Chrome or Chromium build. `chrome-headless-shell` lacks the DevTools frontend.
+
+## Persistent profiles
+
+By default each chat's Chrome runs on a temporary profile, and its cookies, storage, and sign-ins go when the browser closes. Set `profileRoot` to an absolute directory to keep them:
+
+```json
+{
+  "profileRoot": "/var/lib/openchamber-server-browser"
+}
+```
+
+- **One directory per chat.** Each `{ directory, sessionId }` pair gets its own subdirectory, so two chats never open one profile at once.
+- **What survives.** Cookies, local storage, and the cache survive idle expiry and a service restart. Open tabs, history, and the current page do not, and a browser still starts on a blank page.
+- **Growth.** The directory grows with use. Delete it to clear every saved sign-in and cookie.
+- **Temporary again.** Set `"profileRoot": null` or remove the key to go back to temporary profiles.
+
+A persistent profile carries a lease in `<profileRoot>/<chat>/.openchamber-lease/owner.json`. The service renews it every 10 seconds and treats a lease without a heartbeat for 45 seconds as abandoned. It removes stale Chrome `SingletonLock`, `SingletonCookie`, and `SingletonSocket` entries only while holding that lease, so a second service using the same profile is refused instead of having the live one's locks deleted. Do not share one `profileRoot` between two running services.
+
+The first upgrade from a version without leases needs a one-time manual cleanup: stop the old service, then remove `.openchamber-lease`, `SingletonLock`, `SingletonCookie`, and `SingletonSocket` from each existing profile. Recovery is automatic after that. If Chrome fails to start, the error includes a redacted tail of its stderr, and a later request can retry without restarting OpenChamber.
+
+## Surface tuning
+
+The frames the service sends to the panel can be tuned:
+
+```json
+{
+  "surface": { "quality": 72, "everyNthFrame": 1 }
+}
+```
+
+- `quality` is the JPEG quality of each frame, from 1 to 100. The default is 72.
+- `everyNthFrame` sends one frame out of every N, from 1 to 10. The default is 1; `2` is roughly 30 frames per second on a 60 Hz display and halves the bandwidth.
+

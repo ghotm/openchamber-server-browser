@@ -24,19 +24,20 @@ The provider implements `browser.open`, `snapshot`, `click`, `type`, `select`, `
 - **Closing a tab.** `browser.close` closes a tab the agent opened, its most recent one without a `tabId`, and refuses tabs the viewer or a page opened.
 - **Settling.** `browser.open` reports `settled: true` only once the page has loaded and then gone quiet: no new resource and no DOM tree or text change for 500 ms, waiting at most 5 seconds. `browser.capture` waits the same way for at most 3 seconds.
 - **Native selects.** `browser.snapshot` lists each native select's options, up to 32, and a `selector` scopes its text as well as its elements. `browser.select` picks one option of a native single-value select by exact label or value. It refuses ambiguous, disabled, multiple, and custom controls without changing the page.
+- **Marked elements.** `browser.snapshot` also returns `marks`: the elements a person marked for the agent on that tab. Each entry carries a selector, a shadow path when the element sits in a shadow root, tag, role, accessible name, text, the allowed attributes, the bounding box, and a `resolved` flag. See [Marking elements](#marking-elements).
 - **Captures** are one pixel per CSS pixel of the viewport, whatever pixel ratio the panel draws at.
 - **Background tabs.** Acting on a background tab does not change what the viewer sees.
 - **Time limits.** OpenChamber replaces a service that misses an action's time limit, and every chat's browser would go with it. So an action the page does not finish in time fails a little earlier instead, after 18 seconds, or 43 for `browser.open`, with "The page did not respond in time".
 
 ## Scopes and lifetime
 
-Each authoritative `{ directory, sessionId }` pair gets its own Chrome process and temporary profile, with its own cookies, storage, form state, and history. Calls missing either field fail closed instead of reusing another chat's browser.
+Each authoritative `{ directory, sessionId }` pair gets its own Chrome process and profile, with its own cookies, storage, form state, and history. The profile is temporary unless [`profileRoot`](configuration.md#persistent-profiles) is set. Calls missing either field fail closed instead of reusing another chat's browser.
 
 - **At most four scopes.** At the limit, the scope unused for longest makes room once it has been idle for a minute. If every scope was active in the last minute, the new chat's action fails with an explanation.
-- **Idle expiry.** A scope closes after five minutes without agent actions, dock commands, input, or a viewer showing it. That removes its profile and sign-ins.
+- **Idle expiry.** A scope closes after five minutes without agent actions, dock commands, input, or a viewer showing it. That removes its temporary profile and sign-ins; with `profileRoot`, its profile stays for the next visit.
 - **Crashes.** If Chrome exits unexpectedly, the dock says so and the chat's next action starts a new browser.
-- **Stopping.** Stopping or restarting the service stops every Chrome first and then removes its profiles, within the five seconds OpenChamber waits before killing the service. OpenChamber stops an unattended browser provider after ten minutes without actions; an open panel keeps it running.
-- **Nothing persists.** There is no session restore or persistent profile. State survives a live handoff, not idle expiry or a restart.
+- **Stopping.** Stopping or restarting the service stops every Chrome first and then removes temporary profiles, within the five seconds OpenChamber waits before killing the service. Persistent profiles are kept. OpenChamber stops an unattended browser provider after ten minutes without actions; an open panel keeps it running.
+- **Profiles.** Without `profileRoot`, nothing outlives the browser: there is no session restore and no persistent profile. Set [`profileRoot`](configuration.md#persistent-profiles) to keep each chat's cookies and storage across idle expiry and restarts. Open tabs, history, and the current page are still not restored, and state always survives a live handoff.
 
 The first scope becomes visible automatically, and when the visible scope closes, expires, or crashes, the one used most recently takes its place. After that, the dock follows the chat you open in OpenChamber when that chat has a browser, and its session picker, shown once there are two or more, picks any live scope. Agent work in another chat continues in that chat's browser without moving the viewer.
 
@@ -49,7 +50,8 @@ The dock above the picture holds:
 - the console problem count;
 - the DevTools button;
 - a viewport picker with rotation and mobile emulation;
-- the native-select mode.
+- the native-select mode;
+- the element-marking crosshair and its Marks list.
 
 **Who can use the dock.** The viewer holding control can use the dock while other viewers' docks wait.
 
@@ -71,8 +73,19 @@ The dock above the picture holds:
   - Pages see the `keyCode` your browser computed for your layout on OpenChamber 2.6.0 and later, and the US key position's code before that.
   - Dragging selects text and moves sliders.
   - Double and triple clicks select a word and a line; the service counts quick presses itself because hosts send no click count.
-- **Clipboard.** Ctrl/Cmd+C copies the page selection, including inside open shadow roots and same-origin frames, but never a password field. Pasting types the pasted text.
+- **Clipboard.** Ctrl/Cmd+C copies the page selection, including inside open shadow roots and same-origin frames, but never a password field. Pasting types the pasted text. Ctrl/Cmd+X cuts the selection and puts the removed text on the clipboard.
 - **Context menu.** A right click the page does not handle opens a viewer menu drawn inside the page, with Back, Forward, Reload, and Copy. Copy puts the selection on your clipboard. Where OpenChamber cannot write the clipboard (its window must have focus, and some browsers also want a recent click), a notification offers a Copy button instead.
+
+## Marking elements
+
+A person can point the agent at an element instead of describing it. Take control, then click the crosshair button in the dock's toolbar. A box follows the pointer inside the page. A left click records the element under it, a right click or Esc cancels, and each tab keeps its own list of up to 50 marks.
+
+**Marks (N)** next to the crosshair opens the list, where a mark can be removed alone, **Clear all** removes the rest, and **Copy hint** puts a short instruction for the agent on the clipboard. The list closes when the tab loads a new document.
+
+- **Resolution.** `browser.snapshot` returns the marks of the tab it reads. A mark whose selector no longer matches stays in the list and reports `resolved: false`.
+- **Iframes.** Same-origin and cross-origin frames are followed recursively. A mark inside one stores the frame chain, and the snapshot resolves it by walking that chain. Cross-origin frames are reached through a DevTools child target, so the marker can select an element inside them instead of stopping at the frame border.
+- **Shadow roots.** Open, nested, and closed shadow roots all produce a `shadowPath` that the snapshot resolves segment by segment. The hover highlight follows the real element through frames and shadow, not the frame or shadow host.
+- **Handoff.** The marker overlay stays in the page only while marking is armed, and handing control back to the agent cancels the mode without clearing the list. The host refuses agent actions while you hold control, so hand control back before asking the agent to read the marks.
 
 ## Chrome DevTools
 

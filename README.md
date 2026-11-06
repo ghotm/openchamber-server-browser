@@ -10,6 +10,7 @@ A real Chrome that runs on your OpenChamber server, shared by you and your agent
 
 - **Watch the agent work**, live, in the Server Browser panel.
 - **Take over at any moment** by clicking or typing in the page. The agent waits until you hand control back.
+- **Mark elements for the agent**: point at one with the crosshair, and the agent reads what you marked with `browser.snapshot`.
 - **Browse yourself** with tabs, an address bar, back, forward, reload, and phone, tablet, or desktop sizes.
 - **Debug with Chrome DevTools**: Elements, Console, Network, and the rest, for the page you are looking at.
 - **Keep chats apart**: every chat gets its own browser, with its own cookies and sign-ins.
@@ -39,7 +40,7 @@ Ask in a chat, for example "Open https://example.com and tell me what it says." 
 
 - **Taking over.** Click, type, scroll, or paste in the page and you have control; that first click also reaches the page.
 - **While you hold control**, the agent's browser actions wait. Click **Hand back to agent** when you are done.
-- **Copy and paste.** Copy with Cmd/Ctrl+C or by right-clicking and choosing Copy. Double-click selects a word and triple-click a line. Paste works as usual.
+- **Copy and paste.** Copy with Cmd/Ctrl+C or by right-clicking and choosing Copy. Double-click selects a word and triple-click a line. Cut with Cmd/Ctrl+X, and paste as usual.
 
 ### Inspect with Chrome DevTools
 
@@ -73,7 +74,7 @@ Or add `"discoverDevServers": true` to allow any development server running on t
 
 ## Good to know
 
-- **Browsers are temporary.** A chat's browser closes after five minutes unused, and its cookies and sign-ins go with it. Restarting OpenChamber does the same.
+- **Browsers are temporary by default.** A chat's browser closes after five minutes unused, and its cookies and sign-ins go with it. Restarting OpenChamber does the same. Set `"profileRoot"` in `config.json` to keep each chat's cookies and storage across both; open tabs and the current page still are not restored.
 - **Up to four chats** can have a browser at once.
 - **The browser runs on the server.** So `localhost` means the server, not your laptop.
 - **Everyone with the panel sees the same browser.** It is not a privacy barrier between people sharing one OpenChamber.
