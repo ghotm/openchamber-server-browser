@@ -6263,6 +6263,9 @@ ${stderrTail}` : stderrHead || stderrTail;
     stderrTail = "";
     child = spawn(binary, [
       "--headless=new",
+      // Chrome refuses to start as root without this, and containers usually
+      // run as root. It does not change behaviour for other users.
+      ...process.platform !== "win32" && process.getuid?.() === 0 ? ["--no-sandbox"] : [],
       // Headless mode sets navigator.webdriver, which Google sign-in also refuses.
       "--disable-blink-features=AutomationControlled",
       ...userAgent,
@@ -10039,7 +10042,7 @@ var createMemoryReader = ({ platform = process.platform, spawn: spawn2 = spawnPr
   if (output === null) return null;
   const processes = parsePs(output);
   for (const pid of roots.flatMap((root) => subtree(processes, root))) {
-    const rollup = await files.readFile(`/proc/${pid}/smaps_rollup`, "utf8").catch((error) => error?.code === "ENOENT" ? "" : null);
+    const rollup = await files.readFile(`/proc/${pid}/smaps_rollup`, "utf8").catch((error) => error?.code === "ENOENT" || error?.code === "ESRCH" ? "" : null);
     if (rollup === null || rollup === "" && roots.includes(pid)) return null;
     processes.get(pid).bytes = Number(/^Pss:\s+(\d+) kB$/m.exec(rollup)?.[1] ?? 0) * 1024;
   }

@@ -94,7 +94,9 @@ export const createMemoryReader = ({ platform = process.platform, spawn = spawnP
   for (const pid of roots.flatMap((root) => subtree(processes, root))) {
     // A helper that just exited counts nothing. A Chrome without the file
     // (a kernel before 4.14) or one we may not read leaves the figure out.
-    const rollup = await files.readFile(`/proc/${pid}/smaps_rollup`, 'utf8').catch((error) => (error?.code === 'ENOENT' ? '' : null));
+    // A process that exited between `ps` and this read reports ENOENT or
+    // ESRCH depending on the kernel; either way it counts nothing.
+    const rollup = await files.readFile(`/proc/${pid}/smaps_rollup`, 'utf8').catch((error) => (error?.code === 'ENOENT' || error?.code === 'ESRCH' ? '' : null));
     if (rollup === null || (rollup === '' && roots.includes(pid))) return null;
     processes.get(pid).bytes = Number(/^Pss:\s+(\d+) kB$/m.exec(rollup)?.[1] ?? 0) * 1024;
   }
