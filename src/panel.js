@@ -1,16 +1,14 @@
 import { connectHost } from '@openchamber/sdk';
-import { applyHostReady, mountTabs } from '@openchamber/sdk/ui';
+import { applyHostReady } from '@openchamber/sdk/ui';
 
 const host = connectHost();
 const root = document.querySelector('#root');
 if (!root) throw new Error('Missing panel root');
 
-const scopeSelect = document.createElement('fieldset');
-scopeSelect.className = 'session-tabs';
-scopeSelect.setAttribute('aria-label', 'Browser sessions');
-scopeSelect.addEventListener('keydown', (event) => {
-  if (scopeSelect.disabled) event.stopPropagation();
-}, true);
+// A native select: its popup is drawn by the browser, so the short dock does not clip it.
+const scopeSelect = document.createElement('select');
+scopeSelect.className = 'scope-select';
+scopeSelect.setAttribute('aria-label', 'Browser session');
 
 const status = document.createElement('span');
 status.className = 'status';
@@ -90,8 +88,18 @@ selectCompatibility.type = 'button';
 selectCompatibility.className = 'toolbar-button select-compatibility';
 selectCompatibility.setAttribute('aria-pressed', 'false');
 setIcon(selectCompatibility, (svg) => {
-  addPath(svg, 'M5 6.5h14v11H5z');
-  addPath(svg, 'm9 10 3 3 3-3');
+  addPath(svg, 'm7 15 5 5 5-5');
+  addPath(svg, 'm7 9 5-5 5 5');
+});
+
+const devtoolsToggle = document.createElement('button');
+devtoolsToggle.type = 'button';
+devtoolsToggle.className = 'toolbar-button devtools-toggle';
+devtoolsToggle.setAttribute('aria-pressed', 'false');
+setIcon(devtoolsToggle, (svg) => {
+  addPath(svg, 'm8 7-5 5 5 5');
+  addPath(svg, 'm16 7 5 5-5 5');
+  addLine(svg, { x1: '14', y1: '4', x2: '10', y2: '20' });
 });
 
 const address = document.createElement('input');
@@ -100,6 +108,9 @@ address.placeholder = 'https://example.com';
 address.autocomplete = 'off';
 address.spellcheck = false;
 address.setAttribute('aria-label', 'Address');
+
+const omnibox = document.createElement('div');
+omnibox.className = 'omnibox';
 
 const VIEWPORT_PRESETS = Object.freeze({
   mobile: Object.freeze({ label: 'Mobile', width: 390, height: 844, mobile: true }),
@@ -180,7 +191,7 @@ setIcon(cancelSize, (svg) => {
 // Console problems on the visible page. The badge opens a compact list under
 // the address bar and grows the dock; the Browser inspector page keeps the
 // full console and network.
-const DOCK_HEIGHT = 104;
+const DOCK_HEIGHT = 76;
 const CONSOLE_HEIGHT = 132;
 let consoleOpen = false;
 let consoleEntries = null;
@@ -195,6 +206,7 @@ errorCount.className = 'problem-errors';
 const warningCount = document.createElement('span');
 warningCount.className = 'problem-warnings';
 problems.append(errorCount, warningCount);
+omnibox.append(address, problems);
 
 const consolePanel = document.createElement('section');
 consolePanel.id = 'console';
@@ -458,6 +470,7 @@ const pageLabel = (tab) => {
 
 let pageTabsSignature = '';
 const renderPageTabs = (selected, disabled) => {
+  newTab.hidden = !selected;
   newTab.disabled = disabled;
   const items = selected?.tabs ?? [];
   const signature = JSON.stringify([items.map((tab) => [tab.id, pageLabel(tab), tab.url, tab.active]), disabled]);
@@ -518,18 +531,27 @@ chatButton.className = 'chat-button';
 chatButton.textContent = 'Open for this chat';
 chatButton.hidden = true;
 
-const scopeRow = document.createElement('div');
-scopeRow.className = 'row scope-row';
-scopeRow.append(scopeSelect, chatButton, status);
+const divider = () => {
+  const element = document.createElement('span');
+  element.className = 'divider';
+  element.setAttribute('aria-hidden', 'true');
+  return element;
+};
 
-const pageTabsRow = document.createElement('div');
-pageTabsRow.className = 'row page-tabs-row';
-pageTabsRow.append(pageTabs, newTab);
+const viewportGroup = document.createElement('div');
+viewportGroup.className = 'viewport-group';
+viewportGroup.setAttribute('role', 'group');
+viewportGroup.setAttribute('aria-label', 'Viewport');
+viewportGroup.append(mobileToggle, viewportSelect, rotate);
+
+const tabStrip = document.createElement('div');
+tabStrip.className = 'row tab-strip';
+tabStrip.append(scopeSelect, divider(), pageTabs, newTab, status, chatButton);
 
 const navigationRow = document.createElement('div');
 navigationRow.className = 'row navigation-row';
-navigationRow.append(back, forward, reload, address, customSize, problems, markButton, marksButton, viewportSelect, rotate, mobileToggle, selectCompatibility);
-root.append(scopeRow, pageTabsRow, navigationRow, consolePanel, marksPanel);
+navigationRow.append(back, forward, reload, omnibox, customSize, markButton, marksButton, divider(), viewportGroup, divider(), devtoolsToggle, selectCompatibility);
+root.append(tabStrip, navigationRow, consolePanel, marksPanel);
 
 let state = null;
 let requestPending = false;
@@ -537,23 +559,7 @@ let refreshPending = false;
 let commandError = null;
 let serviceError = null;
 let addressDirty = false;
-let tabsSignature = '';
-let pendingTabFocusId = null;
-const tabs = mountTabs(scopeSelect, {
-  items: [],
-  activeId: '',
-  trackBackground: true,
-  onChange: (scopeId) => {
-    if (!state || requestPending || !dockUsable()) return;
-    pendingTabFocusId = scopeId;
-    void request('/browser/select', { scopeId, generation: state.generation }).then((succeeded) => {
-      if (succeeded) addressDirty = false;
-      else pendingTabFocusId = null;
-      render();
-    });
-  },
-});
-scopeSelect.querySelector('[role="tablist"]').setAttribute('aria-label', 'Browser sessions');
+let scopeOptionsSignature = '';
 
 const parseState = (body) => {
   const value = JSON.parse(body);
@@ -588,30 +594,23 @@ const render = () => {
   const usable = dockUsable();
   const markState = state?.mark ?? {};
   const marks = markState.marks ?? [];
-  scopeSelect.disabled = requestPending || scopes.length < 2 || !usable;
+  // One browser needs no picker; the chat it belongs to is the one in view.
+  scopeSelect.hidden = scopes.length < 2;
+  scopeSelect.disabled = requestPending || !usable;
   const chat = currentChat();
   chatButton.hidden = !chat || Boolean(scopeForChat(chat));
   chatButton.disabled = requestPending || !usable;
   if (chat) chatButton.title = `Open a browser for ${chat.title}`;
-  const items = scopes.map((scope) => ({ id: String(scope.id), label: scopeLabel(scope) }));
-  const activeId = selected ? String(selected.id) : '';
-  const signature = JSON.stringify([items, activeId]);
-  if (signature !== tabsSignature) {
-    const focusedId = pendingTabFocusId ?? document.activeElement?.dataset.id;
-    tabs.update({ items, activeId });
-    tabsSignature = signature;
-    for (const button of scopeSelect.querySelectorAll('[role="tab"]')) {
-      if (button.dataset.id === focusedId) {
-        button.focus();
-        pendingTabFocusId = null;
-      }
-    }
+  const options = scopes.map((scope) => [String(scope.id), scopeLabel(scope)]);
+  const signature = JSON.stringify(options);
+  if (signature !== scopeOptionsSignature) {
+    scopeOptionsSignature = signature;
+    scopeSelect.replaceChildren(...options.map(([id, label]) => new Option(label, id)));
   }
-  for (const button of scopeSelect.querySelectorAll('[role="tab"]')) {
-    const scope = scopes.find((item) => String(item.id) === button.dataset.id);
-    const page = scope.title || (scope.url === 'about:blank' ? '' : scope.url);
-    button.title = `${page ? `${page} — ` : ''}${scope.directory} · ${scope.sessionId}`;
-  }
+  // A pick in flight keeps showing until the service answers with it.
+  if (!requestPending) scopeSelect.value = selected ? String(selected.id) : '';
+  const page = selected?.title || (selected?.url === 'about:blank' ? '' : selected?.url);
+  scopeSelect.title = selected ? `${page ? `${page} — ` : ''}${selected.directory} · ${selected.sessionId}` : '';
   if (!addressDirty) address.value = selected?.url === 'about:blank' ? '' : String(selected?.url ?? '');
 
   const disabled = requestPending || !selected || !usable;
@@ -629,6 +628,12 @@ const render = () => {
     : 'Show native select menus in the shared browser';
   selectCompatibility.title = compatibilityLabel;
   selectCompatibility.setAttribute('aria-label', compatibilityLabel);
+  const devtoolsOpen = selected?.devtools === true;
+  devtoolsToggle.disabled = disabled;
+  devtoolsToggle.setAttribute('aria-pressed', String(devtoolsOpen));
+  const devtoolsLabel = devtoolsOpen ? 'Close Chrome DevTools and show the page' : 'Open Chrome DevTools for this page';
+  devtoolsToggle.title = devtoolsLabel;
+  devtoolsToggle.setAttribute('aria-label', devtoolsLabel);
 
   const markUsable = state?.controller === 'user'
     && state?.viewerInControl === true
@@ -661,7 +666,8 @@ const render = () => {
   viewportSelect.title = viewport?.mode === 'fixed' && viewport.source === 'agent'
     ? 'The agent chose this viewport. Pick another size to take it over.'
     : 'Viewport size';
-  rotate.disabled = disabled || viewport?.mode !== 'fixed';
+  rotate.hidden = viewport?.mode !== 'fixed';
+  rotate.disabled = disabled;
   mobileToggle.disabled = disabled || !viewport;
   mobileToggle.setAttribute('aria-pressed', String(viewport?.mobile === true));
 
@@ -705,7 +711,9 @@ const render = () => {
   status.textContent = statusMessage;
   status.title = statusTitle;
   status.setAttribute('aria-label', statusTitle);
-  scopeSelect.title = scopeSelect.disabled ? statusTitle : '';
+  // The host's bar under the dock already says who holds control. Only the dot
+  // goes, so the live region stays in place to announce errors.
+  status.dataset.quiet = String(statusState === 'ready' || (statusState === 'user' && usable));
 };
 
 const request = async (path, payload) => {
@@ -751,15 +759,20 @@ const watchPixelRatio = () => {
 watchPixelRatio();
 
 let lastCopyId = null;
+// The host writes the clipboard where it can, which needs its window focused;
+// otherwise a toast offers its own Copy button.
 const offerCopy = (copy) => {
   if (!copy || copy.id === lastCopyId) return;
   lastCopyId = copy.id;
-  const toast = copy.text === null
-    ? { kind: 'error', message: 'This selection is too long to copy from the menu. Use Ctrl/Cmd+C instead.' }
-    : copy.text
-      ? { kind: 'info', message: 'The selected text is ready to copy.', copy: { text: copy.text } }
-      : { kind: 'info', message: 'Select text on the page to copy it.' };
-  void host.toast(toast).catch(() => {});
+  if (copy.text === null) {
+    void host.toast({ kind: 'error', message: 'This text is too long to copy from the shared browser.' }).catch(() => {});
+    return;
+  }
+  if (!copy.text) {
+    void host.toast({ kind: 'info', message: 'Select text on the page to copy it.' }).catch(() => {});
+    return;
+  }
+  void host.writeClipboard(copy.text).catch(() => host.toast({ kind: 'info', message: 'The copied text is ready.', copy: { text: copy.text } })).catch(() => {});
 };
 
 let lastCutId = null;
@@ -899,6 +912,21 @@ pageTabs.addEventListener('keydown', (event) => {
 
 newTab.addEventListener('click', () => tabCommand('/browser/tabs/new', {}));
 
+scopeSelect.addEventListener('change', () => {
+  if (!state || requestPending || !dockUsable()) return;
+  void request('/browser/select', { scopeId: scopeSelect.value, generation: state.generation }).then((succeeded) => {
+    if (succeeded) addressDirty = false;
+    render();
+  });
+});
+
+devtoolsToggle.addEventListener('click', () => {
+  if (!state) return;
+  const selected = state.scopes.find((scope) => scope.id === state.selectedScopeId);
+  if (!selected) return;
+  void request('/browser/devtools', { open: selected.devtools !== true, generation: state.generation });
+});
+
 selectCompatibility.addEventListener('click', () => {
   if (!state) return;
   const selected = state.scopes.find((scope) => scope.id === state.selectedScopeId);
@@ -943,7 +971,7 @@ const setViewport = (viewport) => {
 
 const closeCustomSize = () => {
   customSize.hidden = true;
-  address.hidden = false;
+  omnibox.hidden = false;
   render();
 };
 
@@ -953,7 +981,7 @@ viewportSelect.addEventListener('change', () => {
   if (viewportSelect.value === 'custom') {
     widthInput.value = String(current.width);
     heightInput.value = String(current.height);
-    address.hidden = true;
+    omnibox.hidden = true;
     customSize.hidden = false;
     widthInput.focus();
     widthInput.select();
@@ -985,7 +1013,7 @@ const applyCustomSize = () => {
   const current = selectedViewport();
   if (!current || !customSize.reportValidity()) return;
   customSize.hidden = true;
-  address.hidden = false;
+  omnibox.hidden = false;
   setViewport({ mode: 'fixed', width: Number(widthInput.value), height: Number(heightInput.value), mobile: current.mobile });
 };
 

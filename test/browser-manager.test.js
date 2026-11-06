@@ -24,6 +24,7 @@ const createRuntimeFactory = () => {
       async command(name, parameters) {
         calls.push(['command', name, parameters]);
         if (name === 'navigate') runtime.url = parameters.url;
+        if (name === 'devtools') runtime.devtoolsOpen = parameters.open;
       },
       async configureViewport(request) { calls.push(['viewport', request]); },
       async surfaceFrame({ after }) {
@@ -188,6 +189,23 @@ test('refuses input and dock commands made on a picture of an earlier view', asy
   assert.deepEqual(inputs(), ['seen', 'blind']);
 });
 
+test('opens DevTools in the viewer\'s color scheme and refuses input made on the page they replaced', async () => {
+  // Given a frame the viewer drew of the page, in a dark theme.
+  const { factory, runtimes } = createRuntimeFactory();
+  const manager = createBrowserManager({ createRuntime: factory });
+  await manager.perform('browser.snapshot', {}, undefined, context('/repo', 'ses_one'));
+  const page = await manager.surfaceFrame({ after: 0, wait: 0 });
+  manager.setViewerTheme({ dark: true, properties: {} });
+
+  // When the dock opens DevTools, then they open dark and the dock sees them.
+  await manager.setDevTools(true, manager.state().generation);
+  assert.deepEqual(runtimes.get('ses_one').calls.at(-1), ['command', 'devtools', { open: true, colorScheme: 'dark' }]);
+  assert.equal(manager.state().scopes[0].devtools, true);
+
+  // Then input made on the page's picture does not reach DevTools.
+  await assert.rejects(manager.surfaceInput([{ type: 'text', text: 'late' }], { viewer: 'viewer-a', frameSeq: page.sequence }), /view changed/);
+});
+
 test('preserves every scope and refuses new work at the configured bound', async () => {
   // Given a manager bounded to two browser runtimes.
   const { factory, runtimes } = createRuntimeFactory();
@@ -314,7 +332,7 @@ test('applies the current viewer size before publishing a newly selected scope',
   // When the user selects that scope, then the surface viewport is applied before it becomes visible.
   await manager.selectScope(manager.state().scopes[1].id, manager.state().generation);
   const calls = runtimes.get('ses_two').calls;
-  assert.deepEqual(calls.at(-1), ['resize', { width: 700, height: 500 }]);
+  assert.deepEqual(calls.at(-1), ['resize', { width: 700, height: 500, scale: 1 }]);
   assert.equal(manager.state().selectedScopeId, manager.state().scopes[1].id);
 });
 
@@ -490,14 +508,14 @@ test('converts the viewer panel with its pixel ratio and sizes a first scope cre
   // When the first scope appears, then it gets the panel's CSS size.
   await manager.perform('browser.snapshot', {}, undefined, context('/repo', 'ses_one'));
   const runtime = runtimes.get('ses_one');
-  assert.deepEqual(runtime.calls.find(([kind]) => kind === 'resize'), ['resize', { width: 700, height: 500 }]);
+  assert.deepEqual(runtime.calls.find(([kind]) => kind === 'resize'), ['resize', { width: 700, height: 500, scale: 2 }]);
 
   // When the window moves to a 1x display, then the page keeps its CSS size, and the host's next measurement uses the new ratio.
   const callCount = runtime.calls.length;
   await manager.setDevicePixelRatio(1);
   assert.equal(runtime.calls.length, callCount);
   await manager.surfaceResize({ width: 800, height: 600 });
-  assert.deepEqual(runtime.calls.at(-1), ['resize', { width: 800, height: 600 }]);
+  assert.deepEqual(runtime.calls.at(-1), ['resize', { width: 800, height: 600, scale: 1 }]);
 
   // When the dock sets a viewport, then it is marked as the viewer's and guarded like other dock mutations.
   await manager.setViewport({ mode: 'fixed', width: 500, height: 400, mobile: false }, manager.state().generation);
@@ -515,7 +533,7 @@ test('works out a panel measured before the dock reported its pixel ratio once t
 
   // When the ratio arrives, then the page gets the panel's CSS size.
   await manager.setDevicePixelRatio(2);
-  assert.deepEqual(runtime.calls.at(-1), ['resize', { width: 700, height: 500 }]);
+  assert.deepEqual(runtime.calls.at(-1), ['resize', { width: 700, height: 500, scale: 2 }]);
 });
 
 test('lists the visible tab\'s errors and warnings only for a dock whose console is open', async () => {
@@ -602,6 +620,68 @@ test('opens the viewed chat\'s browser from the dock without waiting for an agen
   await assert.rejects(manager.openScope({ directory: '/repo', sessionId: '' }, manager.state().generation), /project and chat context/i);
   manager.surfaceControl('user');
   await assert.rejects(manager.openScope(context('/repo', 'ses_three'), manager.state().generation), /idle/i);
+});
+
+test('closes one chat\'s browser from Work Status without waiting behind its action', { timeout: 2_000 }, async () => {
+  // Given two scopes, the visible one with an action waiting on Chrome.
+  const { factory, runtimes } = createRuntimeFactory();
+  const manager = createBrowserManager({ createRuntime: factory });
+  await manager.perform('browser.snapshot', {}, undefined, context('/repo', 'ses_one'));
+  await manager.perform('browser.snapshot', {}, undefined, context('/repo', 'ses_two'));
+  const runtime = runtimes.get('ses_one');
+  let failStuck;
+  runtime.perform = () => new Promise((_resolve, reject) => { failStuck = reject; });
+  runtime.close = async () => {
+    runtime.calls.push(['close']);
+    failStuck(new Error('CDP connection is closed'));
+  };
+  const stuck = assert.rejects(manager.perform('browser.snapshot', {}, undefined, context('/repo', 'ses_one')), /connection is closed/);
+  await new Promise((resolve) => setImmediate(resolve));
+  const generation = manager.state().generation;
+
+  // When the user closes it, then its Chrome stops, the action ends, and the other scope comes forward.
+  await manager.closeScope(manager.state().scopes[0].id);
+  await stuck;
+  assert.deepEqual(manager.state().scopes.map((scope) => scope.sessionId), ['ses_two']);
+  assert.equal(manager.state().selectedScopeId, manager.state().scopes[0].id);
+  assert.ok(manager.state().generation > generation, 'docks acting on the closed browser are refused');
+  assert.equal(runtimes.get('ses_two').calls.some(([kind]) => kind === 'close'), false);
+
+  // When the same button is pressed again, then it says the browser is gone.
+  await assert.rejects(manager.closeScope(JSON.stringify(['/repo', 'ses_one'])), /already closed/);
+});
+
+test('brings the browser used last forward when the visible one closes, crashes, or expires', async () => {
+  // Given three scopes used in turn, the first one visible at the panel's size.
+  let clock = 0;
+  const timers = [];
+  const { factory, runtimes } = createRuntimeFactory();
+  const manager = createBrowserManager({ createRuntime: factory, now: () => clock, setTimer: (callback) => timers.push(callback), clearTimer: () => {} });
+  for (const sessionId of ['ses_one', 'ses_three', 'ses_two']) {
+    clock += 1_000;
+    await manager.perform('browser.snapshot', {}, undefined, context('/repo', sessionId));
+  }
+  await manager.surfaceResize({ width: 800, height: 600 });
+  const visible = () => manager.state().scopes.find((scope) => scope.selected)?.sessionId ?? null;
+  assert.equal(visible(), 'ses_one');
+
+  // When it is closed, then the one used last comes forward at the panel's size.
+  await manager.closeScope(JSON.stringify(['/repo', 'ses_one']));
+  assert.equal(visible(), 'ses_two');
+  assert.deepEqual(runtimes.get('ses_two').calls.at(-1), ['resize', { width: 800, height: 600, scale: 1 }]);
+
+  // When that Chrome crashes, then the next one comes forward and the crash is still reported.
+  runtimes.get('ses_two').die();
+  await manager.surfaceControl('none');
+  assert.equal(visible(), 'ses_three');
+  assert.match(manager.state().notice.message, /stopped unexpectedly/);
+
+  // When the last one expires, then nothing is visible.
+  clock += 10 * 60_000;
+  timers.shift()();
+  await manager.surfaceControl('none');
+  assert.deepEqual(manager.state().scopes, []);
+  assert.equal(manager.state().selectedScopeId, null);
 });
 
 test('closes browsers at once on shutdown instead of waiting behind a stuck action', { timeout: 2_000 }, async () => {

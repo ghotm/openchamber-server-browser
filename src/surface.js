@@ -3,6 +3,10 @@ import { DEFAULT_SURFACE } from './config.js';
 import { coalesceSurfaceEvents } from './input-events.js';
 
 const BUTTON_NAMES = ['left', 'middle', 'right'];
+// Hosts send no click count, so a press this soon after one this close (in
+// frame pixels) continues it, and double and triple clicks select a word and a line.
+const MULTI_CLICK_MS = 500;
+const MULTI_CLICK_DISTANCE = 4;
 const KEY_CODES = Object.freeze({
   Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18, Pause: 19, CapsLock: 20,
   Escape: 27, Space: 32, PageUp: 33, PageDown: 34, End: 35, Home: 36, ArrowLeft: 37,
@@ -81,7 +85,8 @@ const heldButton = (buttons) => (buttons & 1 ? 'left' : buttons & 2 ? 'right' : 
 
 const baseCharacter = (key, code) => code === `Key${key.toUpperCase()}` || code === `Digit${key}`;
 
-const dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
+// scale: frame pixels per CSS pixel; the host sends positions in frame pixels.
+const dispatchInput = async (page, event, { autoRepeat = false, scale = 1 } = {}, clickCount = 0) => {
   if (event.type === 'text') {
     await page.cdp.sendSession(page.sessionId, 'Input.insertText', { text: event.text });
     return;
@@ -90,11 +95,11 @@ const dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
     const types = { down: 'mousePressed', up: 'mouseReleased', move: 'mouseMoved' };
     await page.cdp.sendSession(page.sessionId, 'Input.dispatchMouseEvent', {
       type: types[event.action],
-      x: event.x,
-      y: event.y,
+      x: event.x / scale,
+      y: event.y / scale,
       button: event.action === 'move' ? heldButton(event.buttons) : mouseButton(event.button),
       buttons: event.buttons,
-      clickCount: event.action === 'move' ? 0 : 1,
+      clickCount,
       modifiers: modifiersMask(event.modifiers),
     });
     return;
@@ -102,8 +107,8 @@ const dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
   if (event.type === 'wheel') {
     await page.cdp.sendSession(page.sessionId, 'Input.dispatchMouseEvent', {
       type: 'mouseWheel',
-      x: event.x,
-      y: event.y,
+      x: event.x / scale,
+      y: event.y / scale,
       deltaX: event.deltaX,
       deltaY: event.deltaY,
       modifiers: modifiersMask(event.modifiers),
@@ -111,7 +116,8 @@ const dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
     return;
   }
   const { alt, ctrl, meta, shift } = event.modifiers;
-  const keyCode = virtualKeyCode(event.key, event.code);
+  // The viewer's browser knows the user's layout; hosts before openchamber/openchamber#6051 omit it, and Firefox sends 0 for keys without one.
+  const keyCode = event.keyCode || virtualKeyCode(event.key, event.code);
   const single = [...event.key].length === 1;
   // Option (Mac) and AltGr (Ctrl+Alt on Windows) compose characters. Chords that
   // leave the key on its base character are shortcuts. Linux Chrome refuses to
@@ -206,6 +212,17 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     const cut = runtime.cutRequest;
     if (cut) runtime.clearCutClipboard?.(cut.id);
   };
+  let lastPress = null;
+
+  const clickCount = (event) => {
+    if (event.type !== 'pointer' || event.action === 'move') return 0;
+    if (event.action === 'up') return lastPress?.count ?? 1;
+    const now = Date.now();
+    const continues = lastPress?.button === event.button && now - lastPress.at <= MULTI_CLICK_MS
+      && Math.abs(event.x - lastPress.x) <= MULTI_CLICK_DISTANCE && Math.abs(event.y - lastPress.y) <= MULTI_CLICK_DISTANCE;
+    lastPress = { at: now, x: event.x, y: event.y, button: event.button, count: continues ? lastPress.count + 1 : 1 };
+    return lastPress.count;
+  };
 
   const finishWaiter = (waiter, value) => {
     if (!waiters.delete(waiter)) return;
@@ -233,7 +250,7 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     const retryUntil = Date.now() + 2_000;
     for (;;) {
       const expected = target;
-      const current = await runtime.ensurePage();
+      const current = await runtime.surfacePage();
       if (closed) throw new Error('Surface is closed');
       if (page?.sessionId === current.sessionId && unsubscribe) return current;
       detach();
@@ -246,19 +263,22 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
         const bytes = Buffer.from(String(event.params.data ?? ''), 'base64');
         if (bytes.length === 0 || bytes.length > SURFACE_FRAME_MAX_BYTES) return;
         sequence += 1;
+        // In image pixels, which the host gives its canvas, so a frame at the
+        // viewer's pixel ratio is drawn one to one instead of scaled down.
         publish({
           sequence,
           bytes,
           mime: 'image/jpeg',
-          width: Math.round(event.params.metadata?.deviceWidth ?? runtime.viewport?.width ?? 0),
-          height: Math.round(event.params.metadata?.deviceHeight ?? runtime.viewport?.height ?? 0),
+          width: Math.round((event.params.metadata?.deviceWidth ?? runtime.viewport?.width ?? 0) * runtime.scale),
+          height: Math.round((event.params.metadata?.deviceHeight ?? runtime.viewport?.height ?? 0) * runtime.scale),
           title: runtime.title,
         });
       });
       try {
         await current.cdp.sendSession(current.sessionId, 'Page.startScreencast', {
           format: 'jpeg',
-          quality: surfaceConfig.quality,
+          // DevTools is small text; 72 blurs it.
+          quality: current.devtools ? 90 : surfaceConfig.quality,
           everyNthFrame: surfaceConfig.everyNthFrame,
         });
       } catch (error) {
@@ -312,7 +332,8 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     },
     async input(events, theme = null) {
       const current = await start();
-      const menu = runtime.contextMenu;
+      // DevTools draw their own context menus.
+      const menu = current.devtools ? null : runtime.contextMenu;
       const pendingMoves = [];
       let pendingError = null;
       const flushPendingMoves = async () => {
@@ -324,7 +345,7 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       };
       for (const event of coalesceSurfaceEvents(events)) {
         if (event.type === 'pointer' && event.action === 'move') {
-          pendingMoves.push(dispatchInput(current, event).catch((error) => {
+          pendingMoves.push(dispatchInput(current, event, { scale: runtime.scale }, 0).catch((error) => {
             pendingError ??= error ?? new Error('Pointer move failed');
           }));
           continue;
@@ -338,8 +359,8 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           swallowEscapeUp = false;
           continue;
         }
-        const secondary = event.type === 'pointer' && event.button === 2;
-        if (menu.isOpen) {
+        const secondary = menu !== null && event.type === 'pointer' && event.button === 2;
+        if (menu?.isOpen) {
           // Escape and the wheel only dismiss the menu; other keys and a new
           // right click dismiss it and go on to the page.
           const dismissOnly = event.type === 'wheel' || (event.type === 'key' && event.key === 'Escape');
@@ -363,7 +384,7 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           if (event.action === 'down') pressedKeys.add(keyId);
           else pressedKeys.delete(keyId);
         }
-        await dispatchInput(current, event, { autoRepeat });
+        await dispatchInput(current, event, { autoRepeat, scale: runtime.scale }, clickCount(event));
         if (secondary && event.action === 'up') await menu.settle(current, theme).catch(() => {});
       }
       await flushPendingMoves();
@@ -379,8 +400,8 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       }
       runtime.controller = controller;
     },
-    resize({ width, height }) {
-      return runtime.setPanelSize({ width, height });
+    resize(size) {
+      return runtime.setPanelSize(size);
     },
     async clipboard() {
       if (pendingCut && Date.now() - pendingCut.at <= CUT_CLIPBOARD_TTL_MS) {
@@ -401,6 +422,7 @@ export const createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       clearPendingCut();
       clearCutRequest();
       pressedKeys.clear();
+      lastPress = null;
       detach();
       latest = null;
       for (const waiter of waiters) finishWaiter(waiter, null);

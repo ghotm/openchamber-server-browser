@@ -5,6 +5,7 @@ import { createBrowserActions } from './browser-actions.js';
 import { connectCdp } from './cdp-client.js';
 import { createChromeProcess } from './chrome-process.js';
 import { MENU_BINDING, MENU_WORLD, createContextMenu } from './context-menu.js';
+import { createDevTools } from './devtools.js';
 import { createInspector } from './inspector.js';
 import { createMarkCdp } from './mark-cdp.js';
 import {
@@ -20,7 +21,7 @@ import { DEFAULT_SURFACE, networkGrants, originGrants } from './config.js';
 import { createNativeSelectCompatibility } from './native-select-compatibility.js';
 import { createPolicyProxy } from './policy-proxy.js';
 import { createSurface } from './surface.js';
-import { applyViewport, presetViewport } from './viewports.js';
+import { applyViewport, presetViewport, viewerScale } from './viewports.js';
 
 const boundedText = (value, maximum = 1_000) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, maximum);
 
@@ -106,6 +107,7 @@ export const createBrowserRuntime = ({
   let nativeSelectEnabled = false;
   let cdp = null;
   let contextId = null;
+  let devtools = null;
   let eventCleanup = null;
   let startupPromise = null;
   let pagePromise = null;
@@ -116,11 +118,17 @@ export const createBrowserRuntime = ({
   // 'auto' follows the viewer's panel; 'fixed' keeps a chosen size. The source
   // says who chose it, so an agent's size is not replaced by a panel resize.
   let viewportConfig = { mode: 'auto', source: 'viewer', mobile: false, fixed: null, panel: null };
+  // Pages render at the viewer's pixel ratio once the headless screen has it.
+  let requestedScale = 1;
+  let scale = 1;
+  // The primary screen's id and CSS size, or false where Chrome cannot change it.
+  let primaryScreen = null;
 
   const effectiveViewport = () => {
     const size = viewportConfig.mode === 'fixed' ? viewportConfig.fixed : viewportConfig.panel ?? presetViewport('desktop');
-    return { width: size.width, height: size.height, mobile: viewportConfig.mobile };
+    return { width: size.width, height: size.height, mobile: viewportConfig.mobile, deviceScaleFactor: scale };
   };
+  const devtoolsSize = () => ({ ...(viewportConfig.panel ?? presetViewport('desktop')), deviceScaleFactor: scale });
 
   const markDead = () => {
     if (closed || dead) return;
@@ -158,6 +166,9 @@ export const createBrowserRuntime = ({
         })),
       };
     },
+    get chromePid() {
+      return chrome.process?.pid ?? null;
+    },
     get url() {
       return activeTab()?.url ?? 'about:blank';
     },
@@ -188,7 +199,14 @@ export const createBrowserRuntime = ({
     get nativeSelectCompatibilityError() {
       return activeTab()?.compatibility.error ?? '';
     },
-    // Text the viewer asked to copy from the page menu; the dock offers it through a host toast.
+    get devtoolsOpen() {
+      return activeTargetId !== null && devtools?.targetId === activeTargetId;
+    },
+    // Frame pixels per CSS pixel.
+    get scale() {
+      return scale;
+    },
+    // Text copied from the page menu or DevTools, for the dock to put on the viewer's clipboard.
     get copyRequest() {
       if (!copyRequest || Date.now() - copyRequest.at > 10_000) return null;
       return { id: copyRequest.id, text: copyRequest.text };
@@ -358,6 +376,9 @@ export const createBrowserRuntime = ({
     const previous = activeTab();
     if (previous?.markActive) await cancelMarkMode();
     if (previous) inspector.endTab(previous.sessionId);
+    // shortcut: DevTools close when another tab comes forward instead of
+    // following it; reopen them there if switching tabs while inspecting is common.
+    if (devtools?.targetId) void devtools.close();
     activeTargetId = current.targetId;
     activations += 1;
     current.lastActive = activations;
@@ -377,6 +398,7 @@ export const createBrowserRuntime = ({
     clearTimeout(current.navigationTimer);
     contextMenu.forget(current.sessionId);
     inspector.endTab(current.sessionId);
+    if (devtools?.targetId === targetId) void devtools.close();
     if (activeTargetId !== targetId) {
       notifyTabs();
       return;
@@ -421,6 +443,7 @@ export const createBrowserRuntime = ({
 
   const handleTargetEvent = (event) => {
     const info = event.params.targetInfo;
+    if (event.method === 'Target.targetCreated') devtools?.targetCreated(info);
     if (event.method === 'Target.targetCreated' && isScopePage(info, contextId)) {
       // Pages the site opens (popups, target=_blank) come to the front like in a
       // browser; a tab the agent opened in the background stays behind.
@@ -436,6 +459,10 @@ export const createBrowserRuntime = ({
       if (typeof info.url === 'string') current.url = info.url;
       if (typeof info.title === 'string') current.title = info.title;
     } else if (event.method === 'Target.targetDestroyed') {
+      if (devtools?.targetDestroyed(event.params.targetId)) {
+        surfaceController.retarget();
+        notifyTabs();
+      }
       removeTab(event.params.targetId);
     } else if (event.method === 'Target.detachedFromTarget') {
       const current = sessions.get(event.params.sessionId);
@@ -512,9 +539,17 @@ export const createBrowserRuntime = ({
       if (closed) throw new Error('Browser runtime is closed');
       cdp = nextCdp;
       contextId = nextContextId;
+      devtools = createDevTools({
+        cdp,
+        endpoint: processInfo.endpoint,
+        proxyAddress,
+        scopeContextId: contextId,
+        onCopy: (text) => offerCopy(text, { devtools: true }),
+      });
       cdp.onClose(markDead);
       eventCleanup = cdp.onEvent(handleEvent);
       await cdp.send('Target.setDiscoverTargets', { discover: true });
+      await applyScale();
     } catch (error) {
       if (nextContextId && nextCdp?.isOpen) {
         await nextCdp.send('Target.disposeBrowserContext', { browserContextId: nextContextId }).catch(() => {});
@@ -582,6 +617,12 @@ export const createBrowserRuntime = ({
     return pageOf(current);
   };
   runtime.agentPage = async (tabId) => useTab(await agentTab(tabId));
+
+  // The shared surface shows the active tab, or its DevTools while they are open.
+  runtime.surfacePage = async () => {
+    const page = await runtime.ensurePage();
+    return devtools?.targetId === page.targetId ? devtools.page : page;
+  };
 
   // browser.open without a tab never replaces the viewer's page: it opens a
   // background tab, unless the viewer is on an untouched blank tab. Either
@@ -734,12 +775,48 @@ export const createBrowserRuntime = ({
   };
 
   const applyViewportToTabs = async () => {
-    const viewport = effectiveViewport();
+    // Starting the browser can change the pixel ratio, so the size comes after.
     const page = await runtime.ensurePage();
+    const viewport = effectiveViewport();
     await applyViewport(page.cdp, page.sessionId, viewport);
     await Promise.allSettled([...tabs.values()]
       .filter((current) => current.sessionId !== page.sessionId)
       .map((current) => applyViewport(cdp, current.sessionId, viewport)));
+  };
+
+  // Chrome caps a screencast at its screen's pixel ratio, whatever a page
+  // emulates, so the headless screen takes the viewer's ratio. Its size in CSS
+  // pixels stays, so sites see only devicePixelRatio change, as on the
+  // viewer's own display.
+  const applyScale = async () => {
+    if (requestedScale === scale || primaryScreen === false || !cdp) return;
+    const next = requestedScale;
+    try {
+      if (!primaryScreen) {
+        const [screen] = (await cdp.send('Emulation.getScreenInfos')).screenInfos;
+        primaryScreen = { id: screen.id, width: screen.width, height: screen.height };
+      }
+      // Takes device pixels; getScreenInfos answers in CSS pixels.
+      await cdp.send('Emulation.updateScreen', {
+        screenId: primaryScreen.id,
+        width: Math.round(primaryScreen.width * next),
+        height: Math.round(primaryScreen.height * next),
+        devicePixelRatio: next,
+      });
+    } catch {
+      // Chrome before Emulation.updateScreen keeps 1x frames.
+      primaryScreen ||= false;
+      return;
+    }
+    scale = next;
+    const viewport = effectiveViewport();
+    await Promise.allSettled([...tabs.values()].map(async (current) => {
+      // A live ratio change leaves a mobile page without a viewport tag at a
+      // fraction of its 980px fallback width until the emulation starts over.
+      if (viewport.mobile) await cdp.sendSession(current.sessionId, 'Emulation.clearDeviceMetricsOverride');
+      await applyViewport(cdp, current.sessionId, viewport);
+    }));
+    await devtools?.resize(devtoolsSize());
   };
 
   runtime.configureViewport = async ({ mode, source, width, height, mobile }) => {
@@ -763,8 +840,12 @@ export const createBrowserRuntime = ({
   // The CSS size the viewer's panel can show. A fixed viewport keeps its own
   // size and the host letterboxes it.
   runtime.setPanelSize = async (size) => {
-    viewportConfig = { ...viewportConfig, panel: size };
+    viewportConfig = { ...viewportConfig, panel: { width: size.width, height: size.height } };
+    requestedScale = viewerScale(size.scale);
+    await applyScale();
     if (viewportConfig.mode === 'auto') await applyViewportToTabs();
+    // DevTools always fill the panel, whatever size the page keeps.
+    await devtools?.resize(devtoolsSize());
     const { width, height } = effectiveViewport();
     return { width, height };
   };
@@ -777,6 +858,21 @@ export const createBrowserRuntime = ({
     await cancelMarkMode();
     if (name === 'tab-new') {
       await openTab();
+      return;
+    }
+    if (name === 'devtools') {
+      if (parameters.open) {
+        const page = await runtime.ensurePage();
+        if (devtools.targetId === page.targetId) return;
+        await devtools.open(page.targetId, { size: devtoolsSize(), colorScheme: parameters.colorScheme }).catch(async (error) => {
+          await devtools.close();
+          throw error;
+        });
+      } else {
+        await devtools?.close();
+      }
+      surfaceController.retarget();
+      notifyTabs();
       return;
     }
     if (name === 'tab-select' || name === 'tab-close') {
@@ -824,8 +920,12 @@ export const createBrowserRuntime = ({
   const execute = createBrowserActions(runtime);
   const surfaceController = createSurface(runtime, surface);
 
+  // Text copied in the shared browser, for the dock to put on the viewer's clipboard.
   let copyRequest = null;
   let cutRequest = null;
+  const offerCopy = (text, { devtools = false } = {}) => {
+    copyRequest = { id: crypto.randomUUID(), text: text.length > GUEST_CLIPBOARD_TEXT_MAX ? null : text, at: Date.now(), devtools };
+  };
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
     readSelection: () => surfaceController.clipboard(),
@@ -833,7 +933,7 @@ export const createBrowserRuntime = ({
       if (action === 'back' || action === 'forward' || action === 'reload') {
         void runtime.command(action).catch(() => {});
       } else if (action === 'copy') {
-        copyRequest = { id: crypto.randomUUID(), text: selection.length > GUEST_CLIPBOARD_TEXT_MAX ? null : selection, at: Date.now() };
+        offerCopy(selection);
       }
     },
   });
@@ -880,7 +980,17 @@ export const createBrowserRuntime = ({
   runtime.surfaceInput = (events, theme) => surfaceController.input(events, theme);
   runtime.surfaceControl = (controller) => surfaceController.control(controller);
   runtime.surfaceResize = (size) => surfaceController.resize(size);
-  runtime.surfaceClipboard = () => surfaceController.clipboard();
+  // DevTools copy some things themselves on Cmd/Ctrl+C, such as a selected
+  // element in Elements; the host reads right after the chord, so that copy
+  // goes out here instead of through the dock.
+  runtime.surfaceClipboard = async () => {
+    if (copyRequest?.devtools && copyRequest.text && Date.now() - copyRequest.at < 1_000) {
+      const { text } = copyRequest;
+      copyRequest = null;
+      return text;
+    }
+    return surfaceController.clipboard();
+  };
   runtime.offerCutClipboard = (text) => {
     cutRequest = { id: crypto.randomUUID(), text: text.slice(0, GUEST_CLIPBOARD_TEXT_MAX), at: Date.now() };
     return cutRequest.id;
@@ -905,6 +1015,7 @@ export const createBrowserRuntime = ({
     // kill, and fails the CDP calls that the work below may still wait on.
     await chrome.close();
     cdp?.close();
+    await devtools?.dispose();
     await surfaceController.close();
     inspector.close();
     await pagePromise?.catch(() => {});

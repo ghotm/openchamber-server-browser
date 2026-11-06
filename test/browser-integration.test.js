@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { WebSocket } from 'ws';
 import { createBrowserManager } from '../src/browser-manager.js';
 import { createBrowserRuntime } from '../src/browser-runtime.js';
 import { createChromeProcess, resolveChromePath } from '../src/chrome-process.js';
+import { createStatusSection, treeBytes } from '../src/status-section.js';
 
 const modifiers = Object.freeze({ alt: false, ctrl: false, meta: false, shift: false });
 
@@ -442,6 +446,33 @@ exec "${chromePath}" "$@"
   }
 });
 
+test('measures a real Chrome for Work Status as the system counts it, and closes it from there', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a chat's browser on a page.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const manager = createBrowserManager({ createRuntime: () => createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] }) });
+  context.after(() => manager.close());
+  await manager.perform('browser.open', { url: `${web.origin}/form` }, undefined, { directory: '/repo', sessionId: 'ses_status' });
+  const pid = manager.state().scopes[0].chromePid;
+  const section = createStatusSection({ runtime: manager });
+
+  // When the section reads, then its figure stays under the resident sizes of
+  // the same processes added up, which count shared Chromium code once per process.
+  const [chrome, browser] = (await section.view('/repo')).rows;
+  const resident = new Map(execFileSync('ps', ['-A', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' }).trim().split('\n').map((line) => {
+    const [processId, parent, kib] = line.trim().split(/\s+/).map(Number);
+    return [processId, { parent, bytes: kib * 1024 }];
+  }));
+  const residentTotal = treeBytes(resident, [pid]).get(pid);
+  assert.equal(chrome.id, 'chrome');
+  assert.ok(chrome.content.values[0] > 0 && chrome.content.values[0] < 0.8 * residentTotal, `${chrome.content.values[0]} bytes counted, ${residentTotal} resident`);
+
+  // When its Close button is used, then Chrome is gone.
+  await section.act(browser.actions[0].id);
+  assert.deepEqual(manager.state().scopes, []);
+  assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+});
+
 test('stops Chrome at once on close even when its page no longer answers', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
   // Given a page stuck in an endless loop, with native select styles that a graceful close would try to undo there.
   const web = await startWebFixture();
@@ -580,7 +611,7 @@ test('types editing keys, Enter, select-all, and composed characters like a loca
     type: 'key', action, key, code, modifiers: { ...modifiers, ...pressed },
   })));
 
-  // When the viewer types text, Enter, AltGr and Option characters, and two shortcuts.
+  // When the viewer types text, Enter, AltGr and Option characters, two shortcuts, and punctuation.
   await evaluate('document.querySelector("#notes").focus()');
   await press('a', 'KeyA');
   await press('Enter', 'Enter');
@@ -599,6 +630,21 @@ test('types editing keys, Enter, select-all, and composed characters like a loca
   // Then Enter adds a line, composed characters and shifted symbols are typed,
   // and shortcuts type nothing.
   assert.equal(await evaluate('document.querySelector("#notes").value'), 'a\nb@@#$%^&(');
+
+  // Punctuation whose character codes match editing keys: '.' is Delete, "'" is ArrowRight, '!' is PageUp.
+  await press('.', 'Period');
+  await press('-', 'Minus');
+  await press("'", 'Quote');
+  await press('!', 'Digit1', { shift: true });
+  assert.equal(await evaluate('document.querySelector("#notes").value'), "a\nb@@#$%^&(.-'!");
+
+  // When a German keyboard's '-', on the US Slash key, arrives with the keyCode the viewer's browser reported, and then without one.
+  await evaluate('window.keyCodes = []; document.addEventListener("keydown", (event) => window.keyCodes.push(event.keyCode))');
+  await runtime.surfaceInput(['down', 'up'].map((action) => ({ type: 'key', action, key: '-', code: 'Slash', keyCode: 189, modifiers })));
+  await press('-', 'Slash');
+
+  // Then the page sees the viewer's code, and the US code of the key without it.
+  assert.equal(await evaluate('JSON.stringify(window.keyCodes)'), '[189,191]');
 
   // When the caret moves with End and Home, and Meta+A selects the field.
   await evaluate('document.querySelector("#field").focus(); document.querySelector("#field").setSelectionRange(5, 5)');
@@ -750,6 +796,18 @@ test('drags across page text to select it like a held mouse button', { skip: chr
     { type: 'pointer', action: 'up', x: 200, y: 40, button: 0, buttons: 0, modifiers },
   ]);
   assert.equal(await runtime.surfaceClipboard(), 'Next page');
+
+  // When the viewer double-clicks a word and triple-clicks the line, then they are selected, as hosts send no click count.
+  const click = (x) => [
+    { type: 'pointer', action: 'down', x, y: 40, button: 0, buttons: 1, modifiers },
+    { type: 'pointer', action: 'up', x, y: 40, button: 0, buttons: 0, modifiers },
+  ];
+  await runtime.surfaceInput([...click(80), ...click(80)]);
+  assert.equal(await runtime.surfaceClipboard(), 'page');
+  // A press after the double click's window starts a new count.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await runtime.surfaceInput([...click(80), ...click(80), ...click(81)]);
+  assert.equal((await runtime.surfaceClipboard()).trim(), 'Next page');
 });
 
 test('replaces a scope whose Chrome stopped with a fresh browser on the next action', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
@@ -1042,8 +1100,10 @@ test('sizes pages in CSS pixels for the viewer and keeps a chosen size fixed', {
     returnByValue: true,
   })).result.value;
 
-  // Then the page lays out at the panel's CSS size.
+  // Then the page lays out at the panel's CSS size and renders at its ratio, on a screen of the same CSS size as before.
   assert.equal(await innerSize(), '[700,500]');
+  const screen = await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression: 'JSON.stringify([devicePixelRatio, screen.width, screen.height])', returnByValue: true });
+  assert.equal(screen.result.value, '[2,800,600]');
 
   // When the dock fixes a size, then a later panel resize keeps it.
   await manager.setViewport({ mode: 'fixed', width: 500, height: 400, mobile: false }, manager.state().generation);
@@ -1157,6 +1217,142 @@ test('captures console and network for the inspector and runs JavaScript in the 
   // When another tab comes forward, then this capture is gone.
   await runtime.command('tab-new');
   assert.throws(() => runtime.inspector.events(captureId, cursor), (error) => error.code === 'CAPTURE_GONE');
+});
+
+// Width and height from the JPEG's start-of-frame segment.
+const jpegSize = (bytes) => {
+  for (let offset = 2; offset < bytes.length; offset += 2 + bytes.readUInt16BE(offset + 2)) {
+    if (bytes[offset + 1] >= 0xc0 && bytes[offset + 1] <= 0xc2) return [bytes.readUInt16BE(offset + 7), bytes.readUInt16BE(offset + 5)];
+  }
+  return null;
+};
+
+const openSocket = (url, options) => new Promise((resolve, reject) => {
+  const socket = new WebSocket(url, options);
+  socket.once('open', () => resolve(socket));
+  socket.once('error', reject);
+});
+
+test('shows Chrome DevTools for the visible tab, reaching it only through the relay\'s policy', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {
+  // Given a page at a fixed mobile size in a wider panel on a 2x display.
+  const web = await startWebFixture();
+  context.after(() => close(web.server));
+  const runtime = createBrowserRuntime({ chromePath, allowedOrigins: [web.origin] });
+  context.after(() => runtime.close());
+  await runtime.perform('browser.open', { url: `${web.origin}/`, viewport: 'mobile' });
+  await runtime.surfaceResize({ width: 1000, height: 700, scale: 2 });
+  const page = await runtime.ensurePage();
+  const pageEval = async (expression) => (await page.cdp.sendSession(page.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+
+  // Then the loaded page renders at the viewer's ratio with its layout kept (a page without a
+  // viewport tag lays out 980px wide on a phone), and the agent's capture stays in CSS pixels.
+  let pageFrame = null;
+  await waitFor(async () => {
+    pageFrame = (await runtime.surfaceFrame({ after: pageFrame?.sequence ?? 0, wait: 2_000 })) ?? pageFrame;
+    return pageFrame?.width === 780 && pageFrame.height === 1688 && JSON.stringify(jpegSize(pageFrame.bytes)) === '[780,1688]';
+  }, 10_000);
+  assert.equal(await pageEval('JSON.stringify([devicePixelRatio, innerWidth])'), '[2,980]');
+  const capture = Buffer.from((await runtime.perform('browser.capture', {})).base64, 'base64');
+  assert.deepEqual([capture.readUInt32BE(16), capture.readUInt32BE(20)], [390, 844]);
+
+  // When the dock opens DevTools, then the surface shows Chrome's frontend at the panel's size and the viewer's ratio, connected to the page.
+  await runtime.command('devtools', { open: true, colorScheme: 'dark' });
+  assert.equal(runtime.devtoolsOpen, true);
+  const frontend = await runtime.surfacePage();
+  assert.notEqual(frontend.targetId, page.targetId);
+  const frontendInfo = async () => (await page.cdp.send('Target.getTargetInfo', { targetId: frontend.targetId })).targetInfo;
+  await waitFor(async () => /^DevTools - /.test((await frontendInfo()).title), 15_000);
+  const devtoolsFrame = await runtime.surfaceFrame({ after: pageFrame.sequence, wait: 10_000 });
+  assert.deepEqual([devtoolsFrame.width, devtoolsFrame.height], [2000, 1400]);
+  assert.deepEqual(jpegSize(devtoolsFrame.bytes), [2000, 1400]);
+
+  // Then the host's frame pixels reach DevTools as CSS pixels.
+  const frontendEval = async (expression) => (await frontend.cdp.sendSession(frontend.sessionId, 'Runtime.evaluate', { expression, returnByValue: true })).result.value;
+  await frontendEval('window.lastMove = null; addEventListener("mousemove", (event) => { window.lastMove = [event.clientX, event.clientY]; }, true); true');
+  await runtime.surfaceInput([{ type: 'pointer', action: 'move', x: 400, y: 300, button: 0, buttons: 0, modifiers }]);
+  await waitFor(async () => JSON.stringify(await frontendEval('window.lastMove')) === '[200,150]');
+
+  // When the viewer right-clicks an element, then DevTools draw their own menu, which headless Chrome would not.
+  const findInFrontend = (test) => `(() => {
+    const walk = (root) => {
+      for (const element of root.querySelectorAll('*')) {
+        if (${test}) return element;
+        const found = element.shadowRoot && walk(element.shadowRoot);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(document);
+  })()`;
+  let bodyRow = null;
+  await waitFor(async () => {
+    bodyRow = await frontendEval(`(() => { const tag = ${findInFrontend('element.classList.contains("webkit-html-tag-name") && element.textContent === "body"')}; const box = tag?.getBoundingClientRect(); return box ? [box.left + box.width / 2, box.top + box.height / 2] : null; })()`);
+    return bodyRow !== null;
+  });
+  await runtime.surfaceInput(['down', 'up'].map((action) => ({ type: 'pointer', action, x: bodyRow[0] * 2, y: bodyRow[1] * 2, button: 2, buttons: action === 'down' ? 2 : 0, modifiers })));
+  await waitFor(async () => await frontendEval(`${findInFrontend('element.classList.contains("soft-context-menu")')} !== null`));
+  await runtime.surfaceInput(['down', 'up'].map((action) => ({ type: 'key', action, key: 'Escape', code: 'Escape', modifiers })));
+
+  // When DevTools copy something, then the viewer's copy chord gets it rather than the server's clipboard.
+  await frontendEval('import("./core/host/host.js").then((m) => { m.InspectorFrontendHost.InspectorFrontendHostInstance.copyText("<body>copied</body>"); return true; })');
+  await waitFor(() => runtime.copyRequest?.text === '<body>copied</body>');
+  assert.equal(await runtime.surfaceClipboard(), '<body>copied</body>');
+  assert.equal(runtime.copyRequest, null);
+
+  // Then the relay takes only the frontend, and the frontend gets only what the policy allows.
+  const relayUrl = `ws://${new URL((await frontendInfo()).url).searchParams.get('ws')}`;
+  await assert.rejects(openSocket(relayUrl), /401/);
+  const client = await openSocket(relayUrl, { origin: 'devtools://devtools' });
+  context.after(() => client.terminate());
+  const replies = new Map();
+  client.on('message', (data) => {
+    const message = JSON.parse(data.toString());
+    replies.get(message.id)?.(message);
+  });
+  const call = (id, method, params = {}) => new Promise((resolve) => {
+    replies.set(id, resolve);
+    client.send(JSON.stringify({ id, method, params }));
+  });
+  assert.equal((await call(1, 'Runtime.evaluate', { expression: 'document.title', returnByValue: true })).result.result.value, 'Fixture');
+  assert.match((await call(2, 'Browser.close')).error.message, /not available/);
+  const disconnected = once(client, 'close');
+  client.send(JSON.stringify({ id: 3, method: 'Page.navigate', params: { url: 'file:///etc/passwd' } }));
+  await disconnected;
+
+  // When the frontend opens a page, then it is closed instead of sitting in a window nobody sees.
+  const stray = { id: null, created: Promise.withResolvers(), destroyed: Promise.withResolvers() };
+  const stopWatching = page.cdp.onEvent((event) => {
+    const info = event.params.targetInfo;
+    if (event.method === 'Target.targetCreated' && info?.type === 'page' && info.openerId === frontend.targetId) {
+      stray.id = info.targetId;
+      stray.created.resolve();
+    }
+    if (event.method === 'Target.targetDestroyed' && event.params.targetId === stray.id) stray.destroyed.resolve();
+  });
+  context.after(stopWatching);
+  await frontend.cdp.sendSession(frontend.sessionId, 'Runtime.evaluate', { expression: 'void window.open("about:blank")', userGesture: true });
+  await stray.created.promise;
+  await stray.destroyed.promise;
+
+  // When the dock closes DevTools, then the page shows again at its own size and the frontend is gone.
+  await runtime.command('devtools', { open: false });
+  assert.equal(runtime.devtoolsOpen, false);
+  assert.equal((await runtime.surfaceFrame({ after: devtoolsFrame.sequence, wait: 10_000 })).width, 780);
+  await waitFor(async () => !(await page.cdp.send('Target.getTargets')).targetInfos.some((info) => info.targetId === frontend.targetId));
+
+  // When the viewer moves to a 1x display with DevTools open, then frames come at CSS pixels, not enlarged, and the page is back at 1x.
+  await runtime.command('devtools', { open: true });
+  await runtime.surfaceResize({ width: 1000, height: 700, scale: 1 });
+  let latest = null;
+  await waitFor(async () => {
+    latest = (await runtime.surfaceFrame({ after: latest?.sequence ?? 0, wait: 2_000 })) ?? latest;
+    return latest?.width === 1000 && JSON.stringify(jpegSize(latest.bytes)) === '[1000,700]';
+  }, 10_000);
+  assert.equal(await pageEval('devicePixelRatio'), 1);
+
+  // When another tab comes forward while DevTools are open, then they close.
+  await runtime.command('tab-new');
+  assert.equal(runtime.devtoolsOpen, false);
 });
 
 test('selects a native option by exact label or value', { skip: chromePath ? false : 'Chrome is unavailable' }, async (context) => {

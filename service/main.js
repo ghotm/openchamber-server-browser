@@ -4204,6 +4204,7 @@ var PRESETS = Object.freeze({
   desktop: Object.freeze({ width: 1440, height: 900, mobile: false })
 });
 var MAX_VIEWPORT_DIMENSION = 3840;
+var viewerScale = (ratio) => Number.isFinite(ratio) ? Math.min(3, Math.max(1, ratio)) : 1;
 var presetViewport = (mode) => PRESETS[mode] ?? null;
 var viewportSummary = ({ width, height }) => {
   for (const [mode, preset] of Object.entries(PRESETS)) {
@@ -4222,7 +4223,7 @@ var cssSize = ({ width, height }, devicePixelRatio) => ({
 var applyViewport = (cdp, sessionId, viewport) => cdp.sendSession(sessionId, "Emulation.setDeviceMetricsOverride", {
   width: viewport.width,
   height: viewport.height,
-  deviceScaleFactor: 1,
+  deviceScaleFactor: viewport.deviceScaleFactor ?? 1,
   mobile: viewport.mobile
 });
 
@@ -4272,7 +4273,7 @@ var createBrowserManager = ({
   let view = { key: null, firstSequence: 1 };
   const observeView = () => {
     const entry = selected();
-    const key = entry ? JSON.stringify([entry.id, entry.runtime.tabs?.find((tab) => tab.active)?.id ?? null]) : null;
+    const key = entry ? JSON.stringify([entry.id, entry.runtime.tabs?.find((tab) => tab.active)?.id ?? null, entry.runtime.devtoolsOpen === true]) : null;
     if (key !== view.key) view = { key, firstSequence: frameSequence + 1 };
   };
   const shownEarlierView = (frameSeq) => {
@@ -4303,6 +4304,14 @@ var createBrowserManager = ({
       viewGeneration += 1;
     }
     return entry.runtime.close();
+  };
+  const selectLatest = () => {
+    if (selectedScopeId) return null;
+    const latest = [...scopes.values()].reduce((best, candidate) => !best || candidate.lastActivityAt > best.lastActivityAt ? candidate : best, null);
+    if (!latest) return null;
+    select(latest);
+    return surfaceSize ? latest.runtime.surfaceResize(surfaceSize).catch(() => {
+    }) : null;
   };
   const ensureScope = async (context) => {
     if (!knownScope(context)) {
@@ -4338,6 +4347,7 @@ var createBrowserManager = ({
         message: "Chrome stopped unexpectedly. The next browser action in this chat starts a new browser."
       };
       await removeScope(entry);
+      await selectLatest();
     }).catch(() => {
     }));
     entry.runtime.onTabsChanged(() => {
@@ -4387,6 +4397,7 @@ var createBrowserManager = ({
   const sweepIdleScopes = () => enqueue(async () => {
     const cutoff = now() - idleMs;
     await Promise.all([...scopes.values()].filter((entry) => entry.lastActivityAt <= cutoff).map(removeScope));
+    await selectLatest();
   });
   const scheduleSweep = () => {
     if (closed) return;
@@ -4442,11 +4453,21 @@ var createBrowserManager = ({
           canGoForward: entry.runtime.canGoForward === true,
           nativeSelectCompatibility: entry.runtime.nativeSelectCompatibility === true,
           nativeSelectCompatibilityError: entry.runtime.nativeSelectCompatibilityError ?? "",
+          devtools: entry.runtime.devtoolsOpen === true,
           tabs: entry.runtime.tabs ?? [],
           viewport: entry.runtime.viewportState ?? null,
-          problems: entry.runtime.problemCounts ?? { errors: 0, warnings: 0 }
+          problems: entry.runtime.problemCounts ?? { errors: 0, warnings: 0 },
+          agentActive: entry.runtime.agentActive === true,
+          chromePid: entry.runtime.chromePid ?? null
         }))
       };
+    },
+    // From the Work Status section, after the user confirmed. Not queued behind
+    // an agent action: closing Chrome ends that action instead of waiting for it.
+    closeScope(id) {
+      const entry = scopes.get(id);
+      if (!entry) return Promise.reject(new Error("This browser is already closed"));
+      return Promise.all([removeScope(entry), selectLatest()]);
     },
     // A viewer opens the browser of the chat it is looking at, before any agent
     // action. The dock reports that chat; the host does not attest it per request.
@@ -4554,6 +4575,10 @@ var createBrowserManager = ({
         entry.runtime.clearCutClipboard(id);
       });
     },
+    setDevTools(open, expectedGeneration, access) {
+      const colorScheme = viewerTheme ? viewerTheme.dark ? "dark" : "light" : null;
+      return dockCommand("devtools", { open, colorScheme }, expectedGeneration, access);
+    },
     setViewport({ mode, width, height, mobile }, expectedGeneration, access) {
       return enqueue(async () => {
         requireDockAccess(access);
@@ -4572,7 +4597,7 @@ var createBrowserManager = ({
         const measuredWithoutRatio = devicePixelRatio === null;
         devicePixelRatio = ratio;
         if (!measuredWithoutRatio || !surfaceViewport) return;
-        surfaceSize = cssSize(surfaceViewport, ratio);
+        surfaceSize = { ...cssSize(surfaceViewport, ratio), scale: ratio };
         const entry = selected();
         if (entry) await entry.runtime.surfaceResize(surfaceSize);
       });
@@ -4600,8 +4625,8 @@ var createBrowserManager = ({
       signal?.throwIfAborted();
       if (!entry) {
         if (wait2 === 0) return null;
-        return new Promise((resolve, reject) => {
-          const waiter = { signal, resolve, reject, timer: null, onAbort: null };
+        return new Promise((resolve, reject2) => {
+          const waiter = { signal, resolve, reject: reject2, timer: null, onAbort: null };
           waiter.onAbort = () => finishSelectionWaiter(
             waiter,
             signal.reason ?? new DOMException("Frame request cancelled", "AbortError")
@@ -4669,7 +4694,7 @@ var createBrowserManager = ({
     surfaceResize(size) {
       return enqueue(() => {
         surfaceViewport = size;
-        surfaceSize = cssSize(size, devicePixelRatio ?? 1);
+        surfaceSize = { ...cssSize(size, devicePixelRatio ?? 1), scale: devicePixelRatio ?? 1 };
         return requireSelected().runtime.surfaceResize(surfaceSize);
       });
     },
@@ -4718,15 +4743,16 @@ var createBrowserManager = ({
 };
 
 // src/browser-runtime.js
-import crypto5 from "node:crypto";
+import crypto6 from "node:crypto";
 import path4 from "node:path";
 
 // node_modules/@openchamber/sdk/dist/scrollbar-style.js
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
 var GUEST_SCROLLBAR_CSS = `
 :root {
-  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 40%, transparent);
-  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 65%, transparent);
+  /* Quiet at rest like the app's own thumbs; hover gives a clear grab target. */
+  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 18%, transparent);
+  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 36%, transparent);
   scrollbar-gutter: stable;
 }
 * {
@@ -4780,9 +4806,19 @@ function installGuestScrollbarActivity(doc) {
 }
 var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(document);`;
 
+// node_modules/@openchamber/sdk/dist/manifest.js
+var TRACKER_URL_TOKENS = ["{id}", "{segment}", "{segments+}"];
+var TRACKER_URL_TOKEN_SET = new Set(TRACKER_URL_TOKENS);
+
+// node_modules/@openchamber/sdk/dist/session-events.js
+var GUEST_SESSION_EVENT_TYPES = ["turn-finished", "turn-failed", "permission-asked", "question-asked"];
+var SESSION_EVENTS_IDLE_MS = 10 * 6e4;
+var EVENT_TYPES = new Set(GUEST_SESSION_EVENT_TYPES);
+
 // node_modules/@openchamber/sdk/dist/contract.js
 var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
 var GUEST_CLIPBOARD_TEXT_MAX = 32e3;
+var GUEST_GENERATE_LATE_KEEP_MS = 60 * 6e4;
 var HOST_REQUEST_ERROR_CODES = [
   "HOST_UNAVAILABLE",
   "HOST_TIMEOUT",
@@ -4793,6 +4829,8 @@ var HOST_REQUEST_ERROR_CODES = [
   "NO_INTEGRATION",
   "NO_SERVICE",
   "SERVICE_FAILED",
+  "REQUEST_FAILED",
+  "RESPONSE_TOO_LARGE",
   "NO_SESSION",
   "SESSION_BUSY",
   "NOT_GRANTED",
@@ -4816,12 +4854,14 @@ var BROWSER_CONTROL_ACTIONS = [
   "browser.snapshot",
   "browser.click",
   "browser.type",
+  "browser.select",
   "browser.scroll",
   "browser.back",
   "browser.forward",
   "browser.inspect",
   "browser.capture",
-  "browser.resize"
+  "browser.resize",
+  "browser.close"
 ];
 var BROWSER_PROVIDER_OPEN_TIMEOUT_MS = 45e3;
 var BROWSER_PROVIDER_ACTION_TIMEOUT_MS = 2e4;
@@ -4855,6 +4895,9 @@ var readBrowserProviderRequest = (body) => {
     return null;
   return { requestId, action, parameters, context: readContext(context) };
 };
+var SOURCE_CONTROL_PROVIDER_IDLE_MS = 10 * 6e4;
+var NOTIFICATIONS_PROVIDER_IDLE_MS = 10 * 6e4;
+var TRACKER_PROVIDER_IDLE_MS = 10 * 6e4;
 
 // node_modules/@openchamber/sdk/dist/service-surface.js
 var SURFACE_FRAME_PATH = "/surface/frame";
@@ -4914,7 +4957,11 @@ var readEvent = (value) => {
       return null;
     if (!isText(value.key) || !isText(value.code) || value.key.length > 64 || value.code.length > 64)
       return null;
-    return { type: "key", action: value.action, key: value.key, code: value.code, modifiers };
+    if (value.keyCode === void 0)
+      return { type: "key", action: value.action, key: value.key, code: value.code, modifiers };
+    if (!isFiniteNumber(value.keyCode) || !Number.isInteger(value.keyCode) || value.keyCode < 0 || value.keyCode > 255)
+      return null;
+    return { type: "key", action: value.action, key: value.key, code: value.code, keyCode: value.keyCode, modifiers };
   }
   return null;
 };
@@ -5372,8 +5419,8 @@ var withAbort = async (signal, operation) => {
   signal?.throwIfAborted();
   if (!signal) return operation;
   let rejectAbort;
-  const aborted = new Promise((resolve, reject) => {
-    rejectAbort = reject;
+  const aborted = new Promise((resolve, reject2) => {
+    rejectAbort = reject2;
   });
   const onAbort = () => rejectAbort(signal.reason ?? new DOMException("Action cancelled", "AbortError"));
   signal.addEventListener("abort", onAbort, { once: true });
@@ -5408,7 +5455,7 @@ var readPageInfo = async (page, signal) => {
     title: typeof value?.title === "string" ? value.title : ""
   };
 };
-var waitForLoad = (page, timeoutMs, signal) => new Promise((resolve, reject) => {
+var waitForLoad = (page, timeoutMs, signal) => new Promise((resolve, reject2) => {
   let unsubscribe = null;
   const cleanup = () => {
     clearTimeout(timer);
@@ -5421,7 +5468,7 @@ var waitForLoad = (page, timeoutMs, signal) => new Promise((resolve, reject) => 
   };
   const onAbort = () => {
     cleanup();
-    reject(signal.reason ?? new DOMException("Action cancelled", "AbortError"));
+    reject2(signal.reason ?? new DOMException("Action cancelled", "AbortError"));
   };
   const timer = setTimeout(() => finish(false), timeoutMs);
   timer.unref?.();
@@ -5518,8 +5565,10 @@ var createBrowserActions = (runtime) => async (action, parameters, signal) => {
   if (action === "browser.capture") {
     await withAbort(signal, page.cdp.sendSession(page.sessionId, "Page.enable"));
     await waitForQuiet(page, CAPTURE_QUIET_MAX_MS, signal);
-    const capture = await withAbort(signal, page.cdp.sendSession(page.sessionId, "Page.captureScreenshot", { format: "png" }));
     const metrics = await withAbort(signal, page.cdp.sendSession(page.sessionId, "Page.getLayoutMetrics"));
+    const visible = metrics.cssVisualViewport;
+    const clip2 = runtime.scale > 1 && visible ? { x: visible.pageX, y: visible.pageY, width: visible.clientWidth, height: visible.clientHeight, scale: (visible.scale ?? 1) / runtime.scale } : void 0;
+    const capture = await withAbort(signal, page.cdp.sendSession(page.sessionId, "Page.captureScreenshot", { format: "png", ...clip2 ? { clip: clip2 } : {} }));
     const info = await readPageInfo(page, signal);
     const viewport = metrics.cssLayoutViewport ?? metrics.layoutViewport;
     return {
@@ -5580,19 +5629,19 @@ var connectCdp = async (webSocketDebuggerUrl, {
       return Promise.reject(commandError(method, "connection is closed"));
     }
     const id = nextId++;
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve, reject2) => {
       const timeout = setTimeout(() => {
         pending.delete(id);
-        reject(commandError(method, `timed out after ${commandTimeoutMs}ms`));
+        reject2(commandError(method, `timed out after ${commandTimeoutMs}ms`));
       }, commandTimeoutMs);
       timeout.unref?.();
-      pending.set(id, { method, sessionId, resolve, reject, timeout });
+      pending.set(id, { method, sessionId, resolve, reject: reject2, timeout });
       try {
         socket.send(JSON.stringify({ id, method, params, ...sessionId ? { sessionId } : {} }));
       } catch (error) {
         clearTimeout(timeout);
         pending.delete(id);
-        reject(commandError(method, error instanceof Error ? error.message : String(error)));
+        reject2(commandError(method, error instanceof Error ? error.message : String(error)));
       }
     });
   };
@@ -5623,14 +5672,14 @@ var connectCdp = async (webSocketDebuggerUrl, {
   });
   socket.on("close", () => disconnect("connection closed"));
   socket.on("error", (error) => disconnect(error instanceof Error ? error.message : "connection error"));
-  await new Promise((resolve, reject) => {
+  await new Promise((resolve, reject2) => {
     const handshakeTimer = setTimeout(() => {
       cleanup();
       try {
         socket.terminate();
       } catch {
       }
-      reject(new Error(`WebSocket opening handshake timed out after ${handshakeTimeoutMs}ms`));
+      reject2(new Error(`WebSocket opening handshake timed out after ${handshakeTimeoutMs}ms`));
     }, handshakeTimeoutMs);
     handshakeTimer.unref?.();
     const cleanup = () => {
@@ -5646,11 +5695,11 @@ var connectCdp = async (webSocketDebuggerUrl, {
     };
     const onError = (error) => {
       cleanup();
-      reject(error instanceof Error ? error : new Error(String(error)));
+      reject2(error instanceof Error ? error : new Error(String(error)));
     };
     const onClose = () => {
       cleanup();
-      reject(new Error("CDP connection closed before opening"));
+      reject2(new Error("CDP connection closed before opening"));
     };
     socket.once("open", onOpen);
     socket.once("error", onError);
@@ -6538,6 +6587,423 @@ var createContextMenu = ({ navigationState, readSelection: readSelection2, onAct
   };
 };
 
+// src/devtools.js
+import crypto4 from "node:crypto";
+
+// src/devtools-policy.js
+var PAGE_DOMAINS = /* @__PURE__ */ new Set([
+  "Accessibility",
+  "Animation",
+  "Audits",
+  "Autofill",
+  "BackgroundService",
+  "BluetoothEmulation",
+  "CSS",
+  "CacheStorage",
+  "Console",
+  "DOM",
+  "DOMDebugger",
+  "DOMSnapshot",
+  "DOMStorage",
+  "Debugger",
+  "DeviceOrientation",
+  "Emulation",
+  "EventBreakpoints",
+  "FedCm",
+  "Fetch",
+  "FileSystem",
+  "HeadlessExperimental",
+  "HeapProfiler",
+  "IndexedDB",
+  "Input",
+  "Inspector",
+  "LayerTree",
+  "Log",
+  "Media",
+  "Network",
+  "Overlay",
+  "Page",
+  "Performance",
+  "PerformanceTimeline",
+  "Preload",
+  "Profiler",
+  "Runtime",
+  "Schema",
+  "Security",
+  "ServiceWorker",
+  "Storage",
+  "WebAudio",
+  "WebAuthn"
+]);
+var BLOCKED_PAGE_METHODS = /* @__PURE__ */ new Set([
+  "Page.setDownloadBehavior",
+  // Both hand the page files from the server's disk.
+  "DOM.setFileInputFiles",
+  "Input.dispatchDragEvent",
+  // The dock owns the page's size; DevTools' device mode would replace it.
+  "Emulation.setDeviceMetricsOverride",
+  "Emulation.clearDeviceMetricsOverride"
+]);
+var TARGET_METHODS = /* @__PURE__ */ new Set([
+  "Target.setAutoAttach",
+  "Target.autoAttachRelated",
+  "Target.getTargetInfo",
+  "Target.attachToTarget",
+  "Target.detachFromTarget"
+]);
+var TRACING_METHODS = /* @__PURE__ */ new Set(["Tracing.start", "Tracing.end", "Tracing.getCategories"]);
+var CONTEXT_BOUND_METHODS = /* @__PURE__ */ new Set([
+  "Storage.clearCookies",
+  "Storage.getCookies",
+  "Storage.setCookies"
+]);
+var MAX_PENDING_STREAM_REQUESTS = 1024;
+var reject = () => ({ ok: false });
+var deny = (message) => {
+  const response = { id: message.id, error: { code: -32e3, message: "Command is not available for this page" } };
+  if (message.sessionId) response.sessionId = message.sessionId;
+  return { ok: false, response };
+};
+var isObject = (value) => value?.constructor === Object;
+var isIdentity = (value) => value?.constructor === String && value.length > 0 && value.length <= 256;
+var parseMessage = (raw) => {
+  if (raw?.constructor !== String) return null;
+  try {
+    const value = JSON.parse(raw);
+    return isObject(value) ? value : null;
+  } catch {
+    return null;
+  }
+};
+var safeNavigation = (params) => {
+  if (!isObject(params) || params.url?.constructor !== String) return false;
+  if (params.url === "about:blank") return true;
+  try {
+    const url = new URL(params.url);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+var createDevToolsPolicy = ({ browserContextId, targetId }) => {
+  const sessions = /* @__PURE__ */ new Map();
+  const targets = /* @__PURE__ */ new Set([targetId]);
+  const ioHandles = /* @__PURE__ */ new Map();
+  const pendingNetworkStreams = /* @__PURE__ */ new Map();
+  let pendingNetworkStreamCount = 0;
+  const rememberNetworkStream = (message) => {
+    const sessionId = message.sessionId ?? null;
+    const requests = pendingNetworkStreams.get(sessionId) ?? /* @__PURE__ */ new Set();
+    if (requests.has(message.id)) return true;
+    if (pendingNetworkStreamCount >= MAX_PENDING_STREAM_REQUESTS) return false;
+    requests.add(message.id);
+    pendingNetworkStreams.set(sessionId, requests);
+    pendingNetworkStreamCount += 1;
+    return true;
+  };
+  const registerNetworkStream = (message) => {
+    const sessionId = message.sessionId ?? null;
+    const requests = pendingNetworkStreams.get(sessionId);
+    if (!requests?.delete(message.id)) return;
+    pendingNetworkStreamCount -= 1;
+    if (requests.size === 0) pendingNetworkStreams.delete(sessionId);
+    const resource = message.result?.resource;
+    if (isObject(resource) && resource.success === true && isIdentity(resource.stream)) {
+      ioHandles.set(resource.stream, sessionId);
+    }
+  };
+  const clearSessionResources = (sessionId) => {
+    pendingNetworkStreamCount -= pendingNetworkStreams.get(sessionId)?.size ?? 0;
+    pendingNetworkStreams.delete(sessionId);
+    for (const [handle, ownerSessionId] of ioHandles) {
+      if (ownerSessionId === sessionId) ioHandles.delete(handle);
+    }
+  };
+  const contextAllowed = (params) => !isObject(params) || params.browserContextId === void 0 || params.browserContextId === browserContextId;
+  const targetCommandAllowed = (message) => {
+    if (!TARGET_METHODS.has(message.method)) return false;
+    const params = isObject(message.params) ? message.params : {};
+    if (message.method === "Target.setAutoAttach") {
+      return (params.autoAttach === true || params.autoAttach === false) && (params.autoAttach === false || params.flatten === true) && (params.waitForDebuggerOnStart === void 0 || params.waitForDebuggerOnStart === true || params.waitForDebuggerOnStart === false);
+    }
+    if (message.method === "Target.autoAttachRelated") {
+      return targets.has(params.targetId) && (params.waitForDebuggerOnStart === true || params.waitForDebuggerOnStart === false);
+    }
+    if (message.method === "Target.getTargetInfo") {
+      return params.targetId === void 0 || targets.has(params.targetId);
+    }
+    if (message.method === "Target.attachToTarget") {
+      return isIdentity(params.targetId) && targets.has(params.targetId) && params.flatten === true;
+    }
+    return isIdentity(params.sessionId) && sessions.has(params.sessionId);
+  };
+  const ioCommandAllowed = (message) => {
+    const params = isObject(message.params) ? message.params : {};
+    return (message.method === "IO.read" || message.method === "IO.close") && isIdentity(params.handle) && ioHandles.has(params.handle);
+  };
+  const command = (raw) => {
+    const message = parseMessage(raw);
+    if (!message || !Number.isSafeInteger(message.id) || message.id < 0 || message.method?.constructor !== String || message.method.length > 160 || message.params !== void 0 && !isObject(message.params)) return reject();
+    if (message.sessionId !== void 0 && (!isIdentity(message.sessionId) || !sessions.has(message.sessionId))) return reject();
+    if (!contextAllowed(message.params)) return reject();
+    if (CONTEXT_BOUND_METHODS.has(message.method)) {
+      message.params = { ...message.params ?? {}, browserContextId };
+    }
+    const domain = message.method.split(".", 1)[0];
+    if (domain === "Browser") {
+      return message.method === "Browser.getVersion" ? { ok: true, message } : deny(message);
+    }
+    if (domain === "Target") return targetCommandAllowed(message) ? { ok: true, message } : deny(message);
+    if (domain === "Tracing") return TRACING_METHODS.has(message.method) ? { ok: true, message } : deny(message);
+    if (domain === "IO") {
+      if (!ioCommandAllowed(message)) return reject();
+      if (message.method === "IO.close") ioHandles.delete(message.params.handle);
+      return { ok: true, message };
+    }
+    if (!PAGE_DOMAINS.has(domain) || BLOCKED_PAGE_METHODS.has(message.method)) return deny(message);
+    if (message.method === "Page.navigate" && !safeNavigation(message.params)) return reject();
+    if (message.method === "Network.loadNetworkResource" && !rememberNetworkStream(message)) return deny(message);
+    return { ok: true, message };
+  };
+  const event = (raw) => {
+    const message = parseMessage(raw);
+    if (!message) return reject();
+    if (message.sessionId !== void 0 && !sessions.has(message.sessionId)) return reject();
+    if (message.method === void 0) {
+      if (!Number.isSafeInteger(message.id) || message.id < 0) return reject();
+      registerNetworkStream(message);
+      return { ok: true, message };
+    }
+    if (message.method?.constructor !== String) return reject();
+    if (message.method === "Target.attachedToTarget") {
+      const params = message.params;
+      const info = params?.targetInfo;
+      if (!isIdentity(params?.sessionId) || !isIdentity(info?.targetId)) return reject();
+      const related = info.browserContextId === browserContextId || targets.has(info.openerId);
+      if (!related) return reject();
+      sessions.set(params.sessionId, info.targetId);
+      targets.add(info.targetId);
+    } else if (message.method === "Target.detachedFromTarget") {
+      const detachedSessionId = message.params?.sessionId;
+      const childTarget = sessions.get(detachedSessionId);
+      sessions.delete(detachedSessionId);
+      clearSessionResources(detachedSessionId);
+      if (childTarget) targets.delete(childTarget);
+    } else if (message.method === "Tracing.tracingComplete") {
+      const handle = message.params?.stream;
+      if (isIdentity(handle)) ioHandles.set(handle, null);
+    }
+    return { ok: true, message };
+  };
+  return { command, event };
+};
+
+// src/devtools.js
+var FRONTEND_ORIGIN = "devtools://devtools";
+var MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+var MAX_BUFFERED_BYTES = 64 * 1024 * 1024;
+var MAX_QUEUED_COMMANDS = 1024;
+var COPY_BINDING = "openchamberDevtoolsCopy";
+var FRONTEND_SCRIPT = `(() => {
+  const setUp = () => {
+    if (globalThis.openchamberDevtoolsReady) return;
+    globalThis.openchamberDevtoolsReady = true;
+    void Promise.all([import('./ui/legacy/legacy.js'), import('./core/host/host.js')]).then(([legacy, host]) => {
+      legacy.ContextMenu.ContextMenu.useSoftMenu = true;
+      const frontendHost = host.InspectorFrontendHost.InspectorFrontendHostInstance;
+      const copyText = frontendHost.copyText.bind(frontendHost);
+      frontendHost.copyText = (text) => {
+        if (text !== null && text !== undefined) globalThis.${COPY_BINDING}(String(text));
+        copyText(text);
+      };
+    });
+  };
+  if (document.readyState === 'complete') setUp();
+  else addEventListener('load', setUp, { once: true });
+})()`;
+var pageSocketUrl = (browserEndpoint, targetId) => {
+  const url = new URL(browserEndpoint);
+  url.pathname = `/devtools/page/${encodeURIComponent(targetId)}`;
+  return url.href;
+};
+var createDevTools = ({ cdp, endpoint, proxyAddress, scopeContextId, onCopy }) => {
+  let relayStart = null;
+  let relay = null;
+  let contextStart = null;
+  let contextId = null;
+  let session = null;
+  let creation = Promise.resolve();
+  const frontendViewport = (size) => ({ width: size.width, height: size.height, mobile: false, deviceScaleFactor: size.deviceScaleFactor });
+  const stopCopies = cdp.onEvent((event) => {
+    if (event.method === "Runtime.bindingCalled" && event.params.name === COPY_BINDING && session?.page && event.sessionId === session.page.sessionId) onCopy(String(event.params.payload ?? ""));
+  });
+  const connect = (client, request) => {
+    const current = session;
+    if (!current || request.url !== `/devtools/${current.token}`) {
+      client.terminate();
+      return;
+    }
+    current.link?.close();
+    const policy = createDevToolsPolicy({ browserContextId: scopeContextId, targetId: current.targetId });
+    const upstream = new import_websocket.default(pageSocketUrl(endpoint, current.targetId), { maxPayload: MAX_MESSAGE_BYTES, perMessageDeflate: false });
+    const queued = [];
+    const link = {
+      close() {
+        client.terminate();
+        upstream.terminate();
+      }
+    };
+    current.link = link;
+    const send = (socket, text2) => {
+      if (socket.readyState !== import_websocket.default.OPEN) return;
+      if (socket.bufferedAmount > MAX_BUFFERED_BYTES) link.close();
+      else socket.send(text2);
+    };
+    client.on("message", (data, isBinary) => {
+      const result = isBinary ? { ok: false } : policy.command(data.toString("utf8"));
+      if (result.ok) {
+        const text2 = JSON.stringify(result.message);
+        if (upstream.readyState !== import_websocket.default.CONNECTING) send(upstream, text2);
+        else if (queued.push(text2) > MAX_QUEUED_COMMANDS) link.close();
+      } else if (result.response) {
+        send(client, JSON.stringify(result.response));
+      } else {
+        link.close();
+      }
+    });
+    upstream.on("open", () => {
+      for (const text2 of queued.splice(0)) send(upstream, text2);
+    });
+    upstream.on("message", (data, isBinary) => {
+      const text2 = isBinary ? null : data.toString("utf8");
+      if (text2 !== null && policy.event(text2).ok) send(client, text2);
+      else link.close();
+    });
+    for (const socket of [client, upstream]) {
+      socket.on("close", () => link.close());
+      socket.on("error", () => link.close());
+    }
+  };
+  const ensureRelay = () => {
+    relayStart ??= new Promise((resolve, reject2) => {
+      const server = new import_websocket_server.default({
+        host: "127.0.0.1",
+        port: 0,
+        maxPayload: MAX_MESSAGE_BYTES,
+        perMessageDeflate: false,
+        verifyClient: ({ origin, req }) => origin === FRONTEND_ORIGIN && session !== null && req.url === `/devtools/${session.token}`
+      });
+      server.on("connection", connect);
+      server.once("error", reject2);
+      server.once("listening", () => {
+        relay = server;
+        resolve(server.address().port);
+      });
+    }).catch((error) => {
+      relayStart = null;
+      throw error;
+    });
+    return relayStart;
+  };
+  const ensureContext = (relayPort) => {
+    contextStart ??= cdp.send("Target.createBrowserContext", {
+      proxyServer: proxyAddress,
+      proxyBypassList: `<-loopback>;127.0.0.1:${relayPort}`
+    }).then((context) => {
+      if (typeof context.browserContextId !== "string") throw new Error("Chrome returned no browser context id");
+      contextId = context.browserContextId;
+      return contextId;
+    }).catch((error) => {
+      contextStart = null;
+      throw error;
+    });
+    return contextStart;
+  };
+  const close = async () => {
+    const current = session;
+    session = null;
+    if (!current) return;
+    current.link?.close();
+    const frontendTargetId = await current.created?.then((target) => target.targetId, () => null);
+    if (frontendTargetId && cdp.isOpen) await cdp.send("Target.closeTarget", { targetId: frontendTargetId }).catch(() => {
+    });
+  };
+  return {
+    // The inspected tab, once its DevTools can be shown.
+    get targetId() {
+      return session?.page ? session.targetId : null;
+    },
+    get page() {
+      return session?.page ?? null;
+    },
+    async open(targetId, { size, colorScheme = null }) {
+      await close();
+      const current = { targetId, token: crypto4.randomBytes(32).toString("hex"), created: null, frontendTargetId: null, page: null, link: null };
+      session = current;
+      const stillOpening = () => {
+        if (session !== current) throw new Error("DevTools closed while opening");
+      };
+      const port = await ensureRelay();
+      stillOpening();
+      const browserContextId = await ensureContext(port);
+      stillOpening();
+      current.created = cdp.send("Target.createTarget", {
+        url: `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${port}/devtools/${current.token}`,
+        browserContextId,
+        // A window of its own keeps the inspected tab painting for DevTools' screencast.
+        newWindow: true,
+        background: true
+      }).then((target) => {
+        if (typeof target.targetId !== "string") throw new Error("Chrome returned no DevTools target id");
+        current.frontendTargetId = target.targetId;
+        return target;
+      });
+      creation = current.created.catch(() => {
+      });
+      await current.created;
+      stillOpening();
+      const sessionId = await cdp.attach(current.frontendTargetId);
+      stillOpening();
+      await cdp.sendSession(sessionId, "Runtime.addBinding", { name: COPY_BINDING });
+      await cdp.sendSession(sessionId, "Page.addScriptToEvaluateOnNewDocument", { source: FRONTEND_SCRIPT });
+      await cdp.sendSession(sessionId, "Runtime.evaluate", { expression: FRONTEND_SCRIPT });
+      await applyViewport(cdp, sessionId, frontendViewport(size));
+      if (colorScheme) {
+        await cdp.sendSession(sessionId, "Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: colorScheme }] });
+      }
+      stillOpening();
+      current.page = { cdp, sessionId, targetId: current.frontendTargetId, devtools: true };
+      return current.page;
+    },
+    close,
+    resize(size) {
+      return session?.page ? applyViewport(cdp, session.page.sessionId, frontendViewport(size)) : Promise.resolve();
+    },
+    // Pages the frontend opens, such as a link from the Network panel, would
+    // sit in a window nobody sees.
+    targetCreated(info) {
+      if (info?.type !== "page" || !contextId || info.browserContextId !== contextId) return;
+      void creation.then(() => {
+        if (info.targetId !== session?.frontendTargetId) return cdp.send("Target.closeTarget", { targetId: info.targetId });
+      }).catch(() => {
+      });
+    },
+    // Whether the frontend that was shown went away.
+    targetDestroyed(targetId) {
+      if (!session || session.frontendTargetId !== targetId) return false;
+      session.link?.close();
+      session = null;
+      return true;
+    },
+    async dispose() {
+      stopCopies();
+      await close();
+      for (const client of relay?.clients ?? []) client.terminate();
+      await new Promise((resolve) => relay ? relay.close(() => resolve()) : resolve());
+    }
+  };
+};
+
 // src/mark-cdp.js
 var FRAME_LIMIT = 20;
 var DEPTH_LIMIT = 8;
@@ -7075,7 +7541,7 @@ var createMarkCdp = ({
 };
 
 // src/mark.js
-import crypto4 from "node:crypto";
+import crypto5 from "node:crypto";
 var MARK_WORLD = "openchamber-mark";
 var MARK_LIMIT = 50;
 var MAX_SELECTOR = 2e3;
@@ -7135,7 +7601,7 @@ var sanitizeMarkPayload = (payload, { tabId, url = "", title = "" } = {}) => {
   const tag = clean(payload.tag, MAX_TAG);
   if (!tag) return null;
   return {
-    id: crypto4.randomUUID(),
+    id: crypto5.randomUUID(),
     tabId: typeof tabId === "string" ? tabId : "",
     url: clean(payload.url, MAX_SELECTOR) || clean(url, MAX_SELECTOR),
     title: clean(payload.title, MAX_NAME) || clean(title, MAX_NAME),
@@ -7673,8 +8139,8 @@ var createPolicyProxy = (policy = {}) => {
     async listen() {
       if (listening) return this.address;
       if (closed) throw new Error("Browser proxy is closed");
-      await new Promise((resolve, reject) => {
-        server.once("error", reject);
+      await new Promise((resolve, reject2) => {
+        server.once("error", reject2);
         server.listen(0, "127.0.0.1", resolve);
       });
       listening = true;
@@ -7974,6 +8440,8 @@ var coalesceSurfaceEvents = (events) => {
 
 // src/surface.js
 var BUTTON_NAMES = ["left", "middle", "right"];
+var MULTI_CLICK_MS = 500;
+var MULTI_CLICK_DISTANCE = 4;
 var KEY_CODES = Object.freeze({
   Backspace: 8,
   Tab: 9,
@@ -8106,7 +8574,7 @@ var modifiersMask = (modifiers) => (modifiers.alt ? 1 : 0) | (modifiers.ctrl ? 2
 var mouseButton = (button) => BUTTON_NAMES[button] ?? "none";
 var heldButton = (buttons) => buttons & 1 ? "left" : buttons & 2 ? "right" : buttons & 4 ? "middle" : "none";
 var baseCharacter = (key, code) => code === `Key${key.toUpperCase()}` || code === `Digit${key}`;
-var dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
+var dispatchInput = async (page, event, { autoRepeat = false, scale = 1 } = {}, clickCount = 0) => {
   if (event.type === "text") {
     await page.cdp.sendSession(page.sessionId, "Input.insertText", { text: event.text });
     return;
@@ -8115,11 +8583,11 @@ var dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
     const types = { down: "mousePressed", up: "mouseReleased", move: "mouseMoved" };
     await page.cdp.sendSession(page.sessionId, "Input.dispatchMouseEvent", {
       type: types[event.action],
-      x: event.x,
-      y: event.y,
+      x: event.x / scale,
+      y: event.y / scale,
       button: event.action === "move" ? heldButton(event.buttons) : mouseButton(event.button),
       buttons: event.buttons,
-      clickCount: event.action === "move" ? 0 : 1,
+      clickCount,
       modifiers: modifiersMask(event.modifiers)
     });
     return;
@@ -8127,8 +8595,8 @@ var dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
   if (event.type === "wheel") {
     await page.cdp.sendSession(page.sessionId, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
-      x: event.x,
-      y: event.y,
+      x: event.x / scale,
+      y: event.y / scale,
       deltaX: event.deltaX,
       deltaY: event.deltaY,
       modifiers: modifiersMask(event.modifiers)
@@ -8136,7 +8604,7 @@ var dispatchInput = async (page, event, { autoRepeat = false } = {}) => {
     return;
   }
   const { alt, ctrl, meta, shift } = event.modifiers;
-  const keyCode = virtualKeyCode(event.key, event.code);
+  const keyCode = event.keyCode || virtualKeyCode(event.key, event.code);
   const single = [...event.key].length === 1;
   const composed = single && alt && !baseCharacter(event.key, event.code);
   const modifiers = composed && ctrl ? { alt: false, ctrl: false, meta, shift } : event.modifiers;
@@ -8218,6 +8686,15 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     const cut = runtime.cutRequest;
     if (cut) runtime.clearCutClipboard?.(cut.id);
   };
+  let lastPress = null;
+  const clickCount = (event) => {
+    if (event.type !== "pointer" || event.action === "move") return 0;
+    if (event.action === "up") return lastPress?.count ?? 1;
+    const now = Date.now();
+    const continues = lastPress?.button === event.button && now - lastPress.at <= MULTI_CLICK_MS && Math.abs(event.x - lastPress.x) <= MULTI_CLICK_DISTANCE && Math.abs(event.y - lastPress.y) <= MULTI_CLICK_DISTANCE;
+    lastPress = { at: now, x: event.x, y: event.y, button: event.button, count: continues ? lastPress.count + 1 : 1 };
+    return lastPress.count;
+  };
   const finishWaiter = (waiter, value) => {
     if (!waiters.delete(waiter)) return;
     clearTimeout(waiter.timer);
@@ -8240,7 +8717,7 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     const retryUntil = Date.now() + 2e3;
     for (; ; ) {
       const expected = target;
-      const current = await runtime.ensurePage();
+      const current = await runtime.surfacePage();
       if (closed) throw new Error("Surface is closed");
       if (page?.sessionId === current.sessionId && unsubscribe) return current;
       detach();
@@ -8258,15 +8735,16 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           sequence,
           bytes,
           mime: "image/jpeg",
-          width: Math.round(event.params.metadata?.deviceWidth ?? runtime.viewport?.width ?? 0),
-          height: Math.round(event.params.metadata?.deviceHeight ?? runtime.viewport?.height ?? 0),
+          width: Math.round((event.params.metadata?.deviceWidth ?? runtime.viewport?.width ?? 0) * runtime.scale),
+          height: Math.round((event.params.metadata?.deviceHeight ?? runtime.viewport?.height ?? 0) * runtime.scale),
           title: runtime.title
         });
       });
       try {
         await current.cdp.sendSession(current.sessionId, "Page.startScreencast", {
           format: "jpeg",
-          quality: surfaceConfig.quality,
+          // DevTools is small text; 72 blurs it.
+          quality: current.devtools ? 90 : surfaceConfig.quality,
           everyNthFrame: surfaceConfig.everyNthFrame
         });
       } catch (error) {
@@ -8303,12 +8781,12 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       signal?.throwIfAborted();
       if (latest && latest.sequence > after) return latest;
       if (wait2 === 0) return null;
-      return new Promise((resolve, reject) => {
-        const waiter = { after, signal, resolve, reject, timer: null, onAbort: null };
+      return new Promise((resolve, reject2) => {
+        const waiter = { after, signal, resolve, reject: reject2, timer: null, onAbort: null };
         waiter.onAbort = () => {
           if (!waiters.delete(waiter)) return;
           clearTimeout(waiter.timer);
-          reject(signal.reason ?? new DOMException("Frame request cancelled", "AbortError"));
+          reject2(signal.reason ?? new DOMException("Frame request cancelled", "AbortError"));
         };
         waiter.timer = setTimeout(() => finishWaiter(waiter, null), wait2);
         waiter.timer.unref?.();
@@ -8318,7 +8796,7 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
     },
     async input(events, theme = null) {
       const current = await start();
-      const menu = runtime.contextMenu;
+      const menu = current.devtools ? null : runtime.contextMenu;
       const pendingMoves = [];
       let pendingError = null;
       const flushPendingMoves = async () => {
@@ -8330,7 +8808,7 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       };
       for (const event of coalesceSurfaceEvents(events)) {
         if (event.type === "pointer" && event.action === "move") {
-          pendingMoves.push(dispatchInput(current, event).catch((error) => {
+          pendingMoves.push(dispatchInput(current, event, { scale: runtime.scale }, 0).catch((error) => {
             pendingError ??= error ?? new Error("Pointer move failed");
           }));
           continue;
@@ -8342,8 +8820,8 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           swallowEscapeUp = false;
           continue;
         }
-        const secondary = event.type === "pointer" && event.button === 2;
-        if (menu.isOpen) {
+        const secondary = menu !== null && event.type === "pointer" && event.button === 2;
+        if (menu?.isOpen) {
           const dismissOnly = event.type === "wheel" || event.type === "key" && event.key === "Escape";
           if (dismissOnly || event.type === "key" || secondary && event.action === "down") await menu.close();
           if (dismissOnly) {
@@ -8365,7 +8843,7 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
           if (event.action === "down") pressedKeys.add(keyId);
           else pressedKeys.delete(keyId);
         }
-        await dispatchInput(current, event, { autoRepeat });
+        await dispatchInput(current, event, { autoRepeat, scale: runtime.scale }, clickCount(event));
         if (secondary && event.action === "up") await menu.settle(current, theme).catch(() => {
         });
       }
@@ -8380,8 +8858,8 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       }
       runtime.controller = controller;
     },
-    resize({ width, height }) {
-      return runtime.setPanelSize({ width, height });
+    resize(size) {
+      return runtime.setPanelSize(size);
     },
     async clipboard() {
       if (pendingCut && Date.now() - pendingCut.at <= CUT_CLIPBOARD_TTL_MS) {
@@ -8402,6 +8880,7 @@ var createSurface = (runtime, surfaceConfig = DEFAULT_SURFACE) => {
       clearPendingCut();
       clearCutRequest();
       pressedKeys.clear();
+      lastPress = null;
       detach();
       latest = null;
       for (const waiter of waiters) finishWaiter(waiter, null);
@@ -8455,7 +8934,7 @@ var persistentProfileDir = (profileRoot, scope) => {
   if (typeof scope?.directory !== "string" || scope.directory.length === 0 || typeof scope?.sessionId !== "string" || scope.sessionId.length === 0) {
     throw new Error("config.profileRoot requires a browser scope with project and chat context");
   }
-  const key = crypto5.createHash("sha256").update(scope.directory).update("\0").update(scope.sessionId).digest("hex").slice(0, 32);
+  const key = crypto6.createHash("sha256").update(scope.directory).update("\0").update(scope.sessionId).digest("hex").slice(0, 32);
   return path4.join(profileRoot, key);
 };
 var createBrowserRuntime = ({
@@ -8489,6 +8968,7 @@ var createBrowserRuntime = ({
   let nativeSelectEnabled = false;
   let cdp = null;
   let contextId = null;
+  let devtools = null;
   let eventCleanup = null;
   let startupPromise = null;
   let pagePromise = null;
@@ -8497,10 +8977,14 @@ var createBrowserRuntime = ({
   let dead = null;
   const deathListeners = /* @__PURE__ */ new Set();
   let viewportConfig = { mode: "auto", source: "viewer", mobile: false, fixed: null, panel: null };
+  let requestedScale = 1;
+  let scale = 1;
+  let primaryScreen = null;
   const effectiveViewport = () => {
     const size = viewportConfig.mode === "fixed" ? viewportConfig.fixed : viewportConfig.panel ?? presetViewport("desktop");
-    return { width: size.width, height: size.height, mobile: viewportConfig.mobile };
+    return { width: size.width, height: size.height, mobile: viewportConfig.mobile, deviceScaleFactor: scale };
   };
+  const devtoolsSize = () => ({ ...viewportConfig.panel ?? presetViewport("desktop"), deviceScaleFactor: scale });
   const markDead = () => {
     if (closed || dead) return;
     dead = new Error("Chrome for this chat stopped unexpectedly; retry the action to start a new browser");
@@ -8535,6 +9019,9 @@ var createBrowserRuntime = ({
         }))
       };
     },
+    get chromePid() {
+      return chrome.process?.pid ?? null;
+    },
     get url() {
       return activeTab()?.url ?? "about:blank";
     },
@@ -8565,7 +9052,14 @@ var createBrowserRuntime = ({
     get nativeSelectCompatibilityError() {
       return activeTab()?.compatibility.error ?? "";
     },
-    // Text the viewer asked to copy from the page menu; the dock offers it through a host toast.
+    get devtoolsOpen() {
+      return activeTargetId !== null && devtools?.targetId === activeTargetId;
+    },
+    // Frame pixels per CSS pixel.
+    get scale() {
+      return scale;
+    },
+    // Text copied from the page menu or DevTools, for the dock to put on the viewer's clipboard.
     get copyRequest() {
       if (!copyRequest || Date.now() - copyRequest.at > 1e4) return null;
       return { id: copyRequest.id, text: copyRequest.text };
@@ -8716,6 +9210,7 @@ var createBrowserRuntime = ({
     const previous = activeTab();
     if (previous?.markActive) await cancelMarkMode();
     if (previous) inspector.endTab(previous.sessionId);
+    if (devtools?.targetId) void devtools.close();
     activeTargetId = current.targetId;
     activations += 1;
     current.lastActive = activations;
@@ -8734,6 +9229,7 @@ var createBrowserRuntime = ({
     clearTimeout(current.navigationTimer);
     contextMenu.forget(current.sessionId);
     inspector.endTab(current.sessionId);
+    if (devtools?.targetId === targetId) void devtools.close();
     if (activeTargetId !== targetId) {
       notifyTabs();
       return;
@@ -8776,6 +9272,7 @@ var createBrowserRuntime = ({
   };
   const handleTargetEvent = (event) => {
     const info = event.params.targetInfo;
+    if (event.method === "Target.targetCreated") devtools?.targetCreated(info);
     if (event.method === "Target.targetCreated" && isScopePage(info, contextId)) {
       void attachTab(info.targetId, info.openerId ?? null).then(async (current) => {
         await targetCreation;
@@ -8788,6 +9285,10 @@ var createBrowserRuntime = ({
       if (typeof info.url === "string") current.url = info.url;
       if (typeof info.title === "string") current.title = info.title;
     } else if (event.method === "Target.targetDestroyed") {
+      if (devtools?.targetDestroyed(event.params.targetId)) {
+        surfaceController.retarget();
+        notifyTabs();
+      }
       removeTab(event.params.targetId);
     } else if (event.method === "Target.detachedFromTarget") {
       const current = sessions.get(event.params.sessionId);
@@ -8861,9 +9362,17 @@ var createBrowserRuntime = ({
       if (closed) throw new Error("Browser runtime is closed");
       cdp = nextCdp;
       contextId = nextContextId;
+      devtools = createDevTools({
+        cdp,
+        endpoint: processInfo.endpoint,
+        proxyAddress,
+        scopeContextId: contextId,
+        onCopy: (text2) => offerCopy(text2, { devtools: true })
+      });
       cdp.onClose(markDead);
       eventCleanup = cdp.onEvent(handleEvent);
       await cdp.send("Target.setDiscoverTargets", { discover: true });
+      await applyScale();
     } catch (error) {
       if (nextContextId && nextCdp?.isOpen) {
         await nextCdp.send("Target.disposeBrowserContext", { browserContextId: nextContextId }).catch(() => {
@@ -8922,6 +9431,10 @@ var createBrowserRuntime = ({
     return pageOf(current);
   };
   runtime.agentPage = async (tabId) => useTab(await agentTab(tabId));
+  runtime.surfacePage = async () => {
+    const page = await runtime.ensurePage();
+    return devtools?.targetId === page.targetId ? devtools.page : page;
+  };
   runtime.agentOpenPage = async (tabId) => {
     const current = await agentTab(tabId);
     if (tabId !== void 0) return useTab(current);
@@ -9054,10 +9567,36 @@ var createBrowserRuntime = ({
     await Promise.allSettled([...tabs.values()].filter((current) => current !== active).map((current) => current.compatibility.setEnabled(enabled)));
   };
   const applyViewportToTabs = async () => {
-    const viewport = effectiveViewport();
     const page = await runtime.ensurePage();
+    const viewport = effectiveViewport();
     await applyViewport(page.cdp, page.sessionId, viewport);
     await Promise.allSettled([...tabs.values()].filter((current) => current.sessionId !== page.sessionId).map((current) => applyViewport(cdp, current.sessionId, viewport)));
+  };
+  const applyScale = async () => {
+    if (requestedScale === scale || primaryScreen === false || !cdp) return;
+    const next = requestedScale;
+    try {
+      if (!primaryScreen) {
+        const [screen] = (await cdp.send("Emulation.getScreenInfos")).screenInfos;
+        primaryScreen = { id: screen.id, width: screen.width, height: screen.height };
+      }
+      await cdp.send("Emulation.updateScreen", {
+        screenId: primaryScreen.id,
+        width: Math.round(primaryScreen.width * next),
+        height: Math.round(primaryScreen.height * next),
+        devicePixelRatio: next
+      });
+    } catch {
+      primaryScreen ||= false;
+      return;
+    }
+    scale = next;
+    const viewport = effectiveViewport();
+    await Promise.allSettled([...tabs.values()].map(async (current) => {
+      if (viewport.mobile) await cdp.sendSession(current.sessionId, "Emulation.clearDeviceMetricsOverride");
+      await applyViewport(cdp, current.sessionId, viewport);
+    }));
+    await devtools?.resize(devtoolsSize());
   };
   runtime.configureViewport = async ({ mode, source, width, height, mobile }) => {
     viewportConfig = {
@@ -9074,8 +9613,11 @@ var createBrowserRuntime = ({
     return preset ? runtime.configureViewport({ mode: "fixed", source: "agent", ...preset }) : runtime.configureViewport({ mode: "auto", source: "agent", mobile: false });
   };
   runtime.setPanelSize = async (size) => {
-    viewportConfig = { ...viewportConfig, panel: size };
+    viewportConfig = { ...viewportConfig, panel: { width: size.width, height: size.height } };
+    requestedScale = viewerScale(size.scale);
+    await applyScale();
     if (viewportConfig.mode === "auto") await applyViewportToTabs();
+    await devtools?.resize(devtoolsSize());
     const { width, height } = effectiveViewport();
     return { width, height };
   };
@@ -9085,6 +9627,21 @@ var createBrowserRuntime = ({
     await cancelMarkMode();
     if (name === "tab-new") {
       await openTab();
+      return;
+    }
+    if (name === "devtools") {
+      if (parameters.open) {
+        const page2 = await runtime.ensurePage();
+        if (devtools.targetId === page2.targetId) return;
+        await devtools.open(page2.targetId, { size: devtoolsSize(), colorScheme: parameters.colorScheme }).catch(async (error) => {
+          await devtools.close();
+          throw error;
+        });
+      } else {
+        await devtools?.close();
+      }
+      surfaceController.retarget();
+      notifyTabs();
       return;
     }
     if (name === "tab-select" || name === "tab-close") {
@@ -9129,6 +9686,9 @@ var createBrowserRuntime = ({
   const surfaceController = createSurface(runtime, surface);
   let copyRequest = null;
   let cutRequest = null;
+  const offerCopy = (text2, { devtools: devtools2 = false } = {}) => {
+    copyRequest = { id: crypto6.randomUUID(), text: text2.length > GUEST_CLIPBOARD_TEXT_MAX ? null : text2, at: Date.now(), devtools: devtools2 };
+  };
   const contextMenu = createContextMenu({
     navigationState: () => ({ canGoBack: runtime.canGoBack, canGoForward: runtime.canGoForward }),
     readSelection: () => surfaceController.clipboard(),
@@ -9137,7 +9697,7 @@ var createBrowserRuntime = ({
         void runtime.command(action).catch(() => {
         });
       } else if (action === "copy") {
-        copyRequest = { id: crypto5.randomUUID(), text: selection.length > GUEST_CLIPBOARD_TEXT_MAX ? null : selection, at: Date.now() };
+        offerCopy(selection);
       }
     }
   });
@@ -9180,9 +9740,16 @@ var createBrowserRuntime = ({
   runtime.surfaceInput = (events, theme) => surfaceController.input(events, theme);
   runtime.surfaceControl = (controller) => surfaceController.control(controller);
   runtime.surfaceResize = (size) => surfaceController.resize(size);
-  runtime.surfaceClipboard = () => surfaceController.clipboard();
+  runtime.surfaceClipboard = async () => {
+    if (copyRequest?.devtools && copyRequest.text && Date.now() - copyRequest.at < 1e3) {
+      const { text: text2 } = copyRequest;
+      copyRequest = null;
+      return text2;
+    }
+    return surfaceController.clipboard();
+  };
   runtime.offerCutClipboard = (text2) => {
-    cutRequest = { id: crypto5.randomUUID(), text: text2.slice(0, GUEST_CLIPBOARD_TEXT_MAX), at: Date.now() };
+    cutRequest = { id: crypto6.randomUUID(), text: text2.slice(0, GUEST_CLIPBOARD_TEXT_MAX), at: Date.now() };
     return cutRequest.id;
   };
   runtime.clearCutClipboard = (id) => {
@@ -9202,6 +9769,7 @@ var createBrowserRuntime = ({
     shutdownController.abort(new DOMException("Browser runtime stopped", "AbortError"));
     await chrome.close();
     cdp?.close();
+    await devtools?.dispose();
     await surfaceController.close();
     inspector.close();
     await pagePromise?.catch(() => {
@@ -9403,9 +9971,179 @@ var createDevServerScanner = ({
 };
 
 // src/service.js
-import crypto6 from "node:crypto";
+import crypto8 from "node:crypto";
 import http2 from "node:http";
 import net3 from "node:net";
+
+// src/status-section.js
+import { spawn as spawnProcess2 } from "node:child_process";
+import crypto7 from "node:crypto";
+import fs5 from "node:fs/promises";
+var STEP_SECONDS = 30;
+var CHART_POINTS = 60;
+var CHART_GAP_MS = 3 * STEP_SECONDS * 1e3;
+var LABEL_MAX = 60;
+var TEXT_MAX = 200;
+var clip = (text2, max) => text2.length > max ? `${text2.slice(0, max - 1)}\u2026` : text2;
+var scopeKey = (id) => crypto7.createHash("sha256").update(id).digest("hex").slice(0, 16);
+var formatBytes = (bytes) => bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`;
+var pageHost = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+};
+var subtree = (processes, root) => {
+  const children = /* @__PURE__ */ new Map();
+  for (const [pid, { parent }] of processes) {
+    const siblings = children.get(parent);
+    if (siblings) siblings.push(pid);
+    else children.set(parent, [pid]);
+  }
+  const seen = /* @__PURE__ */ new Set();
+  const pending = [root];
+  while (pending.length > 0) {
+    const pid = pending.pop();
+    if (seen.has(pid) || !processes.has(pid)) continue;
+    seen.add(pid);
+    pending.push(...children.get(pid) ?? []);
+  }
+  return [...seen];
+};
+var treeBytes = (processes, roots) => new Map(roots.filter((root) => processes.has(root)).map((root) => [root, subtree(processes, root).reduce((sum, pid) => sum + processes.get(pid).bytes, 0)]));
+var UNITS = { B: 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 };
+var parseTop = (output) => {
+  const processes = /* @__PURE__ */ new Map();
+  for (const line of String(output ?? "").split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)([BKMGT])[+-]?\s*$/.exec(line);
+    if (match) processes.set(Number(match[1]), { parent: Number(match[2]), bytes: Math.round(Number(match[3]) * UNITS[match[4]]) });
+  }
+  return processes;
+};
+var parsePs = (output) => {
+  const processes = /* @__PURE__ */ new Map();
+  for (const line of String(output ?? "").split("\n")) {
+    const [pid, parent] = line.trim().split(/\s+/).map(Number);
+    if (Number.isInteger(pid) && Number.isInteger(parent)) processes.set(pid, { parent, bytes: 0 });
+  }
+  return processes;
+};
+var createMemoryReader = ({ platform = process.platform, spawn: spawn2 = spawnProcess2, files = fs5 } = {}) => async (roots) => {
+  if (platform === "darwin") {
+    const output2 = await runCommand(spawn2, "top", ["-l", "1", "-stats", "pid,ppid,mem"]);
+    return output2 === null ? null : treeBytes(parseTop(output2), roots);
+  }
+  if (platform !== "linux") return null;
+  const output = await runCommand(spawn2, "ps", ["-A", "-o", "pid=,ppid="]);
+  if (output === null) return null;
+  const processes = parsePs(output);
+  for (const pid of roots.flatMap((root) => subtree(processes, root))) {
+    const rollup = await files.readFile(`/proc/${pid}/smaps_rollup`, "utf8").catch((error) => error?.code === "ENOENT" ? "" : null);
+    if (rollup === null || rollup === "" && roots.includes(pid)) return null;
+    processes.get(pid).bytes = Number(/^Pss:\s+(\d+) kB$/m.exec(rollup)?.[1] ?? 0) * 1024;
+  }
+  return treeBytes(processes, roots);
+};
+var statusView = (state, { directory = null, memory = null, history = [] } = {}) => {
+  const rows = [];
+  const scopes = state.scopes;
+  const bytesOf = (scope) => memory?.get(scope.chromePid);
+  if (memory) {
+    const total = scopes.reduce((sum, scope) => sum + (bytesOf(scope) ?? 0), 0);
+    rows.push({
+      kind: "line",
+      id: "chrome",
+      label: "Chrome",
+      content: { kind: "chart", values: history, unit: "bytes", step: STEP_SECONDS },
+      value: formatBytes(total),
+      tooltip: `Memory of the server's Chrome for ${scopes.length === 1 ? "one browser" : `${scopes.length} browsers`}, across all projects`
+    });
+  }
+  const own = directory ? scopes.filter((scope) => scope.directory === directory) : scopes;
+  for (const scope of own) {
+    const key = scopeKey(scope.id);
+    const inControl = state.controller === "user" && scope.selected;
+    const activity = scope.agentActive ? "Agent working" : inControl ? "You have control" : "Idle";
+    const { errors = 0, warnings = 0 } = scope.problems ?? {};
+    const tabs = scope.tabs?.length ?? 0;
+    const bytes = scopes.length > 1 ? bytesOf(scope) : void 0;
+    rows.push({
+      kind: "line",
+      id: `browser-${key}`,
+      label: clip(scope.title || pageHost(scope.url) || "New tab", LABEL_MAX),
+      dot: scope.agentActive ? "warning" : inControl ? "accent" : "success",
+      value: bytes === void 0 ? void 0 : formatBytes(bytes),
+      valueTone: bytes === void 0 ? void 0 : "muted",
+      badge: errors > 0 ? { label: `\u2715 ${errors}`, tone: "error" } : warnings > 0 ? { label: `\u26A0 ${warnings}`, tone: "warning" } : void 0,
+      tooltip: clip([
+        activity,
+        scope.url === "about:blank" ? null : scope.url,
+        `${tabs} ${tabs === 1 ? "tab" : "tabs"}`,
+        `chat ${scope.sessionId}`
+      ].filter(Boolean).join(" \xB7 "), TEXT_MAX),
+      actions: [{
+        kind: "button",
+        id: `close-${key}`,
+        label: "Close",
+        variant: "outline",
+        // The host shows this in the button itself.
+        confirm: "Close it?"
+      }]
+    });
+  }
+  if (own.length === 0) {
+    rows.push({
+      kind: "note",
+      id: "none",
+      tone: "muted",
+      text: `No browser ${directory ? "in this project" : "yet"}. The agent opens one with openchamber_web.`
+    });
+  }
+  return { rows };
+};
+var createStatusSection = ({ runtime, readMemory = createMemoryReader(), now = Date.now }) => {
+  let memory = null;
+  let history = [];
+  let sampledAt = -Infinity;
+  let sampledPids = "";
+  let sampling = null;
+  const sample = (pids) => {
+    const key = pids.join(" ");
+    if (sampling) return sampling;
+    if (now() - sampledAt < STEP_SECONDS * 1e3 && key === sampledPids) return Promise.resolve();
+    sampling = (async () => {
+      const at = now();
+      const next = pids.length > 0 ? await readMemory(pids).catch(() => null) : null;
+      if (!next || next.size === 0) {
+        memory = null;
+        history = [];
+      } else {
+        if (at - sampledAt > CHART_GAP_MS) history = [];
+        memory = next;
+        history = [...history, [...next.values()].reduce((sum, bytes) => sum + bytes, 0)].slice(-CHART_POINTS);
+      }
+      sampledAt = at;
+      sampledPids = key;
+    })().finally(() => {
+      sampling = null;
+    });
+    return sampling;
+  };
+  return {
+    async view(directory) {
+      await sample(runtime.state().scopes.map((scope) => scope.chromePid).filter(Number.isInteger));
+      return statusView(runtime.state(), { directory, memory, history });
+    },
+    async act(id) {
+      const scope = runtime.state().scopes.find((candidate) => id === `close-${scopeKey(candidate.id)}`);
+      if (!scope) throw new Error("This browser is already closed");
+      await runtime.closeScope(scope.id);
+    }
+  };
+};
+
+// src/service.js
 var BODY_MAX_BYTES = 17 * 1024 * 1024;
 var json = (response, status, body) => {
   const bytes = Buffer.from(JSON.stringify(body));
@@ -9424,7 +10162,7 @@ var authorized = (request, token) => {
   if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
   const provided = Buffer.from(header.slice(7));
   const expected = Buffer.from(token);
-  return provided.length === expected.length && crypto6.timingSafeEqual(provided, expected);
+  return provided.length === expected.length && crypto8.timingSafeEqual(provided, expected);
 };
 var withScheme = (address) => {
   if (/^[a-z][a-z\d+.-]*:\/\//i.test(address)) return address;
@@ -9546,6 +10284,7 @@ var createService = ({ runtime, token, port = 0 }) => {
   if (typeof token !== "string" || token.length === 0) throw new Error("createService requires a bearer token");
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("Service port must be from 0 to 65535");
   const activeRequests = /* @__PURE__ */ new Set();
+  const status = createStatusSection({ runtime });
   let listening = false;
   let closePromise = null;
   const handle = async (request, response, signal) => {
@@ -9561,6 +10300,19 @@ var createService = ({ runtime, token, port = 0 }) => {
         return json(response, 200, { ok: true, data });
       } catch (error) {
         return json(response, 200, { ok: false, error: errorMessage(error) });
+      }
+    }
+    if (url.pathname === "/status" && request.method === "GET") {
+      return json(response, 200, await status.view(url.searchParams.get("directory") || null));
+    }
+    if (url.pathname === "/status" && request.method === "POST") {
+      const id = stringProperty(await readObjectBody(request), "id");
+      if (!id) return json(response, 400, { message: "The section sent no control id" });
+      try {
+        await status.act(id);
+        return json(response, 200, { ok: true });
+      } catch (error) {
+        return json(response, 404, { message: errorMessage(error).slice(0, 300) });
       }
     }
     const access = dockAccess(request);
@@ -9700,6 +10452,17 @@ var createService = ({ runtime, token, port = 0 }) => {
         return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
       }
     }
+    if (request.method === "POST" && url.pathname === "/browser/devtools") {
+      const body = await readObjectBody(request);
+      const generation = generationProperty(body);
+      if (typeof body?.open !== "boolean" || generation === null) return text(response, 400, "open and generation are required\n");
+      try {
+        await runtime.setDevTools(body.open, generation, access);
+        return json(response, 200, runtime.state(access));
+      } catch (error) {
+        return json(response, dockErrorStatus(error), { ok: false, error: errorMessage(error) });
+      }
+    }
     if (request.method === "POST" && url.pathname === "/browser/select-compatibility") {
       const body = await readObjectBody(request);
       const generation = generationProperty(body);
@@ -9799,8 +10562,8 @@ var createService = ({ runtime, token, port = 0 }) => {
   return {
     async listen() {
       if (listening) return this.address;
-      await new Promise((resolve, reject) => {
-        server.once("error", reject);
+      await new Promise((resolve, reject2) => {
+        server.once("error", reject2);
         server.listen(port, "127.0.0.1", resolve);
       });
       listening = true;

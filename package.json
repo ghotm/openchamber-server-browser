@@ -1,6 +1,6 @@
 {
   "name": "@josuegalre/openchamber-server-browser",
-  "version": "0.8.1",
+  "version": "0.9.1",
   "private": true,
   "description": "Server-owned Chrome browser provider and shared surface for OpenChamber",
   "type": "module",
@@ -21,11 +21,19 @@
         "icon": "computer",
         "entry": "panel/index.html",
         "dock": "top",
-        "size": 104
+        "size": 76
       },
       "page": {
         "entry": "panel/inspector.html",
         "title": "Browser inspector"
+      },
+      "statusSection": {
+        "entry": "panel/status.html",
+        "source": {
+          "path": "/status",
+          "interval": 5000
+        },
+        "height": 28
       },
       "service": {
         "entry": "service/main.js",
@@ -39,7 +47,8 @@
             "chromium",
             "google-chrome",
             "lsof",
-            "ps"
+            "ps",
+            "top"
           ]
         }
       }
@@ -53,7 +62,7 @@
     "package": "node scripts/package.mjs"
   },
   "dependencies": {
-    "@openchamber/sdk": "2.5.3",
+    "@openchamber/sdk": "2.6.0",
     "ws": "8.18.3"
   },
   "devDependencies": {

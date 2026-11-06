@@ -38,6 +38,7 @@ const createRuntime = () => {
     },
     async inspectorEvaluate(captureId, expression) { calls.push(['inspector-evaluate', captureId, expression]); return { text: '2', isError: false, truncated: false }; },
     async openScope(scope, generation) { calls.push(['open-scope', scope, generation]); },
+    async closeScope(id) { calls.push(['close-scope', id]); },
     setViewerTheme(theme) { calls.push(['theme', theme]); },
     async setDevicePixelRatio(ratio) { calls.push(['ratio', ratio]); },
     async setViewport(viewport, generation) { calls.push(['viewport', viewport, generation]); },
@@ -48,6 +49,7 @@ const createRuntime = () => {
     async back(generation) { calls.push(['back', generation]); },
     async forward(generation) { calls.push(['forward', generation]); },
     async setNativeSelectCompatibility(enabled, generation) { calls.push(['select-compatibility', enabled, generation]); },
+    async setDevTools(open, generation) { calls.push(['devtools', open, generation]); },
     async surfaceFrame(request) {
       calls.push(['frame', request.after, request.wait]);
       return { sequence: 4, bytes: Buffer.from('jpeg'), mime: 'image/jpeg', width: 800, height: 600, title: 'Frame 😀\nTitle' };
@@ -78,12 +80,38 @@ test('requires the bearer token on every service endpoint', async (context) => {
     ['/surface/control', { method: 'POST', body: '{}' }],
     ['/surface/resize', { method: 'POST', body: '{}' }],
     ['/surface/clipboard', { method: 'GET' }],
+    ['/status', { method: 'GET' }],
+    ['/status', { method: 'POST', body: '{}' }],
   ];
 
   const responses = await Promise.all(requests.map(([path, init]) => fetch(`${fixture.origin}${path}`, init)));
 
   assert.deepEqual(responses.map((response) => response.status), requests.map(() => 401));
   assert.deepEqual(fixture.runtime.calls, []);
+});
+
+test('answers the Work Status section and closes the browser its button names', async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.service.close());
+  const status = `${fixture.origin}/status?directory=%2Frepo&locale=en`;
+  const post = (body) => fetch(status, { method: 'POST', headers: authorization, body: JSON.stringify(body) });
+
+  const read = await fetch(status, { headers: authorization });
+  const view = await read.json();
+  const acted = await post({ id: view.rows[0].actions[0].id });
+  const gone = await post({ id: 'close-0000000000000000' });
+  const invalid = await post({});
+  const elsewhere = await (await fetch(`${fixture.origin}/status?directory=%2Fother&locale=en`, { headers: authorization })).json();
+
+  assert.equal(read.status, 200);
+  assert.equal(view.rows[0].label, 'Example');
+  assert.equal(acted.status, 200);
+  assert.deepEqual(fixture.runtime.calls, [['close-scope', '["/repo","ses_1"]']]);
+  assert.equal(gone.status, 404);
+  assert.match((await gone.json()).message, /already closed/);
+  assert.equal(invalid.status, 400);
+  assert.ok((await invalid.json()).message);
+  assert.deepEqual(elsewhere.rows.map((row) => row.id), ['none']);
 });
 
 test('dispatches SDK browser and surface protocol requests', async (context) => {
@@ -291,6 +319,22 @@ test('native select compatibility route parses a boolean and uses dock generatio
   assert.equal(invalid.status, 400);
   assert.equal(enabled.status, 200);
   assert.deepEqual(fixture.runtime.calls, [['select-compatibility', true, 1]]);
+});
+
+test('DevTools route parses a boolean and uses dock generation', async (context) => {
+  const fixture = await startFixture();
+  context.after(() => fixture.service.close());
+
+  const invalid = await fetch(`${fixture.origin}/browser/devtools`, {
+    method: 'POST', headers: authorization, body: JSON.stringify({ open: 1, generation: 1 }),
+  });
+  const opened = await fetch(`${fixture.origin}/browser/devtools`, {
+    method: 'POST', headers: authorization, body: JSON.stringify({ open: true, generation: 1 }),
+  });
+
+  assert.equal(invalid.status, 400);
+  assert.equal(opened.status, 200);
+  assert.deepEqual(fixture.runtime.calls, [['devtools', true, 1]]);
 });
 
 

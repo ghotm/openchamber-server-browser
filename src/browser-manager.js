@@ -43,7 +43,8 @@ export const createBrowserManager = ({
   // dock reports the ratio. Pages keep the CSS size worked out when the host
   // measured, so a ratio change alone (a window moving to another display)
   // does not shrink them. Only a panel measured before the first ratio report
-  // is worked out again when that report arrives.
+  // is worked out again when that report arrives. The ratio goes along as
+  // scale, at which pages and DevTools render.
   let surfaceViewport = null;
   let surfaceSize = null;
   let devicePixelRatio = null;
@@ -66,12 +67,15 @@ export const createBrowserManager = ({
   const selected = () => selectedScopeId ? scopes.get(selectedScopeId) ?? null : null;
 
   // Viewers act on the picture they last drew, named by our frame sequence. A
-  // view is the visible scope and its active tab; input or a dock command made
-  // on a frame of an earlier view is refused so it cannot land in this one.
+  // view is the visible scope, its active tab, and whether its DevTools show;
+  // input or a dock command made on a frame of an earlier view is refused so it
+  // cannot land in this one.
   let view = { key: null, firstSequence: 1 };
   const observeView = () => {
     const entry = selected();
-    const key = entry ? JSON.stringify([entry.id, entry.runtime.tabs?.find((tab) => tab.active)?.id ?? null]) : null;
+    const key = entry
+      ? JSON.stringify([entry.id, entry.runtime.tabs?.find((tab) => tab.active)?.id ?? null, entry.runtime.devtoolsOpen === true])
+      : null;
     if (key !== view.key) view = { key, firstSequence: frameSequence + 1 };
   };
   const shownEarlierView = (frameSeq) => {
@@ -106,6 +110,16 @@ export const createBrowserManager = ({
       viewGeneration += 1;
     }
     return entry.runtime.close();
+  };
+
+  // With the visible browser closed, the one used last comes forward instead
+  // of an empty panel. A failed resize leaves it at its last size.
+  const selectLatest = () => {
+    if (selectedScopeId) return null;
+    const latest = [...scopes.values()].reduce((best, candidate) => (!best || candidate.lastActivityAt > best.lastActivityAt ? candidate : best), null);
+    if (!latest) return null;
+    select(latest);
+    return surfaceSize ? latest.runtime.surfaceResize(surfaceSize).catch(() => {}) : null;
   };
 
   const ensureScope = async (context) => {
@@ -145,6 +159,7 @@ export const createBrowserManager = ({
         message: 'Chrome stopped unexpectedly. The next browser action in this chat starts a new browser.',
       };
       await removeScope(entry);
+      await selectLatest();
     }).catch(() => {}));
     // A tab switch changes what the dock commands act on, like a scope switch.
     entry.runtime.onTabsChanged(() => {
@@ -204,6 +219,7 @@ export const createBrowserManager = ({
   const sweepIdleScopes = () => enqueue(async () => {
     const cutoff = now() - idleMs;
     await Promise.all([...scopes.values()].filter((entry) => entry.lastActivityAt <= cutoff).map(removeScope));
+    await selectLatest();
   });
   const scheduleSweep = () => {
     if (closed) return;
@@ -259,11 +275,21 @@ export const createBrowserManager = ({
           canGoForward: entry.runtime.canGoForward === true,
           nativeSelectCompatibility: entry.runtime.nativeSelectCompatibility === true,
           nativeSelectCompatibilityError: entry.runtime.nativeSelectCompatibilityError ?? '',
+          devtools: entry.runtime.devtoolsOpen === true,
           tabs: entry.runtime.tabs ?? [],
           viewport: entry.runtime.viewportState ?? null,
           problems: entry.runtime.problemCounts ?? { errors: 0, warnings: 0 },
+          agentActive: entry.runtime.agentActive === true,
+          chromePid: entry.runtime.chromePid ?? null,
         })),
       };
+    },
+    // From the Work Status section, after the user confirmed. Not queued behind
+    // an agent action: closing Chrome ends that action instead of waiting for it.
+    closeScope(id) {
+      const entry = scopes.get(id);
+      if (!entry) return Promise.reject(new Error('This browser is already closed'));
+      return Promise.all([removeScope(entry), selectLatest()]);
     },
     // A viewer opens the browser of the chat it is looking at, before any agent
     // action. The dock reports that chat; the host does not attest it per request.
@@ -371,6 +397,10 @@ export const createBrowserManager = ({
         entry.runtime.clearCutClipboard(id);
       });
     },
+    setDevTools(open, expectedGeneration, access) {
+      const colorScheme = viewerTheme ? (viewerTheme.dark ? 'dark' : 'light') : null;
+      return dockCommand('devtools', { open, colorScheme }, expectedGeneration, access);
+    },
     setViewport({ mode, width, height, mobile }, expectedGeneration, access) {
       return enqueue(async () => {
         requireDockAccess(access);
@@ -389,7 +419,7 @@ export const createBrowserManager = ({
         const measuredWithoutRatio = devicePixelRatio === null;
         devicePixelRatio = ratio;
         if (!measuredWithoutRatio || !surfaceViewport) return;
-        surfaceSize = cssSize(surfaceViewport, ratio);
+        surfaceSize = { ...cssSize(surfaceViewport, ratio), scale: ratio };
         const entry = selected();
         if (entry) await entry.runtime.surfaceResize(surfaceSize);
       });
@@ -489,7 +519,7 @@ export const createBrowserManager = ({
     surfaceResize(size) {
       return enqueue(() => {
         surfaceViewport = size;
-        surfaceSize = cssSize(size, devicePixelRatio ?? 1);
+        surfaceSize = { ...cssSize(size, devicePixelRatio ?? 1), scale: devicePixelRatio ?? 1 };
         return requireSelected().runtime.surfaceResize(surfaceSize);
       });
     },
