@@ -1863,8 +1863,25 @@ ${GUEST_UI_LOOK_CSS}`;
     addPath(svg, "m16 7 5 5-5 5");
     addLine(svg, { x1: "14", y1: "4", x2: "10", y2: "20" });
   });
+  var keyboardToggle = document.createElement("button");
+  keyboardToggle.type = "button";
+  keyboardToggle.className = "toolbar-button keyboard-toggle";
+  keyboardToggle.setAttribute("aria-pressed", "false");
+  setIcon(keyboardToggle, (svg) => {
+    addPath(svg, "M4 6h16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z");
+    addPath(svg, "M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8");
+  });
+  var typingField = document.createElement("textarea");
+  typingField.className = "typing-field";
+  typingField.autocomplete = "off";
+  typingField.autocapitalize = "off";
+  typingField.spellcheck = false;
+  typingField.setAttribute("aria-label", "Text to type into the page");
   var address = document.createElement("input");
-  address.type = "url";
+  address.type = "text";
+  address.inputMode = "url";
+  address.enterKeyHint = "go";
+  address.autocapitalize = "off";
   address.placeholder = "https://example.com";
   address.autocomplete = "off";
   address.spellcheck = false;
@@ -1910,18 +1927,20 @@ ${GUEST_UI_LOOK_CSS}`;
     addPath(svg, "M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z");
     addLine(svg, { x1: "11", y1: "18", x2: "13", y2: "18" });
   });
+  var MAX_SIZE = 3840;
   var sizeInput = (label) => {
     const input = document.createElement("input");
-    input.type = "number";
-    input.min = "1";
-    input.max = "3840";
-    input.step = "1";
+    input.type = "text";
+    input.inputMode = "numeric";
+    input.pattern = "[1-9][0-9]*";
+    input.title = `A whole number of pixels up to ${MAX_SIZE}`;
     input.required = true;
     input.setAttribute("aria-label", label);
     return input;
   };
   var widthInput = sizeInput("Viewport width");
   var heightInput = sizeInput("Viewport height");
+  heightInput.enterKeyHint = "done";
   var times = document.createElement("span");
   times.textContent = "\xD7";
   times.setAttribute("aria-hidden", "true");
@@ -1940,7 +1959,6 @@ ${GUEST_UI_LOOK_CSS}`;
     addLine(svg, { x1: "6", y1: "6", x2: "18", y2: "18" });
     addLine(svg, { x1: "18", y1: "6", x2: "6", y2: "18" });
   });
-  var DOCK_HEIGHT = 76;
   var CONSOLE_HEIGHT = 132;
   var consoleOpen = false;
   var consoleEntries = null;
@@ -2114,8 +2132,7 @@ ${GUEST_UI_LOOK_CSS}`;
       consolePanel.hidden = true;
       root.classList.remove("console-open");
     }
-    void host.setHeight(marksOpen ? DOCK_HEIGHT + MARKS_HEIGHT : DOCK_HEIGHT).catch(() => {
-    });
+    syncHeight();
     render();
     if (marksOpen) void request("/browser/mark/resolve", {});
   });
@@ -2265,8 +2282,19 @@ ${tab.url}`;
   tabStrip.append(scopeSelect, divider(), pageTabs, newTab, status, chatButton);
   var navigationRow = document.createElement("div");
   navigationRow.className = "row navigation-row";
-  navigationRow.append(back, forward, reload, omnibox, customSize, markButton, marksButton, divider(), viewportGroup, divider(), devtoolsToggle, selectCompatibility);
+  navigationRow.append(back, forward, reload, omnibox, customSize, markButton, marksButton, divider(), viewportGroup, divider(), devtoolsToggle, selectCompatibility, keyboardToggle);
   root.append(tabStrip, navigationRow, consolePanel, marksPanel);
+  document.body.append(typingField);
+  var requestedHeight = null;
+  var syncHeight = () => {
+    if (!root.clientWidth) return;
+    const height = Math.ceil(navigationRow.getBoundingClientRect().bottom) + (consoleOpen ? CONSOLE_HEIGHT : 0) + (marksOpen ? MARKS_HEIGHT : 0);
+    if (height === requestedHeight) return;
+    requestedHeight = height;
+    void host.setHeight(height).catch(() => {
+      requestedHeight = null;
+    });
+  };
   var state = null;
   var requestPending = false;
   var refreshPending = false;
@@ -2341,6 +2369,14 @@ ${tab.url}`;
     markButton.disabled = requestPending || !markUsable;
     markButton.setAttribute("aria-pressed", String(markState.active === true));
     markButton.title = markState.active ? "Cancel marking" : markUsable ? "Mark an element on the page" : "Take control of the page first: click or type in it, then use the crosshair.";
+    const inControl = state?.viewerInControl === true && Boolean(selected);
+    if (!inControl && document.activeElement === typingField) typingField.blur();
+    const typingOpen = document.activeElement === typingField;
+    keyboardToggle.disabled = !inControl;
+    keyboardToggle.setAttribute("aria-pressed", String(typingOpen));
+    const keyboardLabel = typingOpen ? "Hide the keyboard" : inControl ? "Type into the page with the keyboard" : "Tap a field in the page to take control, then type into it";
+    keyboardToggle.title = keyboardLabel;
+    keyboardToggle.setAttribute("aria-label", keyboardLabel);
     const { errors = 0, warnings = 0 } = selected?.problems ?? {};
     problems.hidden = errors + warnings === 0 && !consoleOpen;
     errorCount.textContent = errors || !warnings ? `\u2715 ${errors}` : "";
@@ -2492,9 +2528,8 @@ ${tab.url}`;
     if (marksOpen) marksOpen = false;
     consoleOpen = !consoleOpen;
     consoleEntries = null;
-    void host.setHeight(consoleOpen ? DOCK_HEIGHT + CONSOLE_HEIGHT : DOCK_HEIGHT).catch(() => {
-    });
     render();
+    syncHeight();
     void refresh();
   });
   back.addEventListener("click", () => {
@@ -2603,6 +2638,14 @@ ${tab.url}`;
   address.addEventListener("input", () => {
     addressDirty = true;
   });
+  var selectAddressOnClick = false;
+  address.addEventListener("pointerdown", () => {
+    selectAddressOnClick = document.activeElement !== address;
+  });
+  address.addEventListener("click", () => {
+    if (selectAddressOnClick) address.select();
+    selectAddressOnClick = false;
+  });
   var navigate = () => {
     if (!state || !address.value.trim()) return;
     const url = address.value.trim();
@@ -2659,6 +2702,7 @@ ${tab.url}`;
   });
   var applyCustomSize = () => {
     const current = selectedViewport();
+    for (const input of [widthInput, heightInput]) input.setCustomValidity(Number(input.value) > MAX_SIZE ? input.title : "");
     if (!current || !customSize.reportValidity()) return;
     customSize.hidden = true;
     omnibox.hidden = false;
@@ -2674,6 +2718,53 @@ ${tab.url}`;
       event.preventDefault();
       applyCustomSize();
     }
+  });
+  var NO_MODIFIERS = Object.freeze({ alt: false, ctrl: false, meta: false, shift: false });
+  var keyPress = (key) => ["down", "up"].map((action) => ({ type: "key", action, key, code: key, modifiers: NO_MODIFIERS }));
+  var typing = Promise.resolve();
+  var sendTyping = (events) => {
+    if (!events.length) return;
+    typing = typing.then(async () => {
+      if (!state) return;
+      const result = await host.serviceRequest({
+        method: "POST",
+        path: "/browser/type",
+        body: JSON.stringify({ events, generation: state.generation })
+      });
+      if (result.status !== 204) throw new Error(errorFromBody(result.body) ?? `Service returned ${result.status}`);
+    }).catch((error) => {
+      commandError = error instanceof Error ? error.message : "Typing failed";
+      render();
+    });
+  };
+  var typed = "";
+  typingField.addEventListener("input", () => {
+    const next = typingField.value;
+    let common = 0;
+    while (common < typed.length && common < next.length && typed[common] === next[common]) common += 1;
+    const events = [];
+    for (let index = typed.length; index > common; index -= 1) events.push(...keyPress("Backspace"));
+    next.slice(common).split("\n").forEach((line, index) => {
+      if (index > 0) events.push(...keyPress("Enter"));
+      if (line) events.push({ type: "text", text: line });
+    });
+    typed = next.includes("\n") ? "" : next;
+    if (!typed) typingField.value = "";
+    sendTyping(events);
+  });
+  typingField.addEventListener("keydown", (event) => {
+    if (event.key === "Backspace" && !typingField.value) sendTyping(keyPress("Backspace"));
+  });
+  typingField.addEventListener("focus", render);
+  typingField.addEventListener("blur", () => {
+    typed = "";
+    typingField.value = "";
+    render();
+  });
+  keyboardToggle.addEventListener("mousedown", (event) => event.preventDefault());
+  keyboardToggle.addEventListener("click", () => {
+    if (document.activeElement === typingField) typingField.blur();
+    else typingField.focus();
   });
   var mounted = false;
   host.onReady((context) => {
@@ -2691,9 +2782,10 @@ ${tab.url}`;
     };
     if (mounted) return;
     mounted = true;
-    void host.setHeight(DOCK_HEIGHT).catch(() => {
-    });
     render();
+    const rows = new ResizeObserver(syncHeight);
+    rows.observe(tabStrip);
+    rows.observe(navigationRow);
     void refresh();
     window.setInterval(() => {
       void refresh();

@@ -51,7 +51,16 @@ The dock above the picture holds:
 - the DevTools button;
 - a viewport picker with rotation and mobile emulation;
 - the native-select mode;
-- the element-marking crosshair and its Marks list.
+- the element-marking crosshair and its Marks list;
+- on touch screens, a keyboard button for typing into the page.
+
+**Narrow panels and phones.** In a panel narrower than 560 px, the address gets a line of its own and the viewport, DevTools, and native-select controls move under it. Under a touch pointer the controls grow to touch size, and the address keeps 16 px text so iOS does not zoom in. The dock asks OpenChamber for the height its rows take, plus the error list while it is open.
+
+**Typing from a phone.** The picture cannot open a phone's keyboard, so under a touch pointer the dock has a keyboard button. Once you hold control (the tap on the page's field takes it), the button opens the keyboard on a hidden field of the dock and types into the page what you type there: text as text, the keyboard's deletions and autocorrections as Backspaces, and line breaks as Enter. It is refused for any other viewer, and handing control back closes it.
+
+**Fields on a phone.** The address and the custom size fields are text fields with the URL and number keyboards, because Chrome on Android ignores `enterkeyhint` on URL and number fields and offers Next instead of Go. The click or tap that focuses the address selects it, as in a browser.
+
+From OpenChamber 2.7.1 the phone shows the panel, with the picture, as a workspace tab, and the Browser inspector under **More** in the sessions list. The manifest opts both in with `panel.mobile` and `page.mobile`; older hosts ignore the keys.
 
 **Who can use the dock.** The viewer holding control can use the dock while other viewers' docks wait.
 
@@ -63,7 +72,7 @@ The dock above the picture holds:
   - You can open, switch, and close them; closing a popup returns to the tab that opened it.
   - Titles, loading state, and history update live, and **Stop** interrupts a slow load.
   - Every tab the extension opens gets its own Chrome window, so a background tab keeps painting and the agent can capture it. A tab a page opens from a link shares its opener's window, as in Chrome.
-- **Sizes and sharpness.** Pages are sized in CSS pixels and drawn at your display's pixel ratio, so text stays sharp on high-density displays without changing the page's layout.
+- **Sizes and sharpness.** Pages are sized in CSS pixels and drawn at your display's pixel ratio, rounded to a whole number from 1 to 3 (Chrome takes no other), so text stays sharp on high-density displays without changing the page's layout.
   - **Fit panel** follows the panel.
   - A preset (mobile, tablet, desktop), a custom size, rotation, or mobile emulation fixes the size until someone picks another, and OpenChamber letterboxes it.
   - The picker says when the agent chose the current size.

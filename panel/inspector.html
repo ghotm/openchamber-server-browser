@@ -21,7 +21,8 @@
       .hint { margin: 0; color: var(--oc-muted, currentColor); font-size: 12px; }
       .banner:empty { display: none; }
       .banner { padding: 8px 16px 0; }
-      .body { min-height: 0; overflow: hidden; }
+      /* Its own row: an empty banner leaves the grid, and the body would take its auto row. */
+      .body { grid-row: 3; min-height: 0; overflow: hidden; }
       .view { display: grid; height: 100%; min-height: 0; }
       .view[hidden], .empty[hidden], .details[hidden] { display: none; }
       .empty { padding: 48px 16px; }
@@ -80,6 +81,17 @@
       .icon-button { display: inline-flex; width: 28px; height: 28px; flex: 0 0 28px; align-items: center; justify-content: center; padding: 0; border: 0; border-radius: var(--oc-radius, 6px); background: transparent; color: var(--oc-muted, currentColor); cursor: pointer; }
       .icon-button:hover { background: var(--oc-hover, transparent); color: var(--oc-fg, inherit); }
       button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px solid var(--oc-focus, currentColor); outline-offset: 1px; }
+      /* A phone: a console message gets its own line under its level and source, and requests keep method, status, address and time. */
+      @media (max-width: 519px) {
+        .header, .repl { padding-inline: 12px; }
+        .console-row { grid-template-columns: minmax(0, 1fr) auto; padding-inline: 12px; }
+        .console-row .meta { grid-row: 1; grid-column: 2; }
+        .console-row .text { grid-column: 1 / -1; }
+        .network-head, .network-row { grid-template-columns: 48px 52px minmax(0, 1fr) 60px; padding-inline: 12px; }
+        .network-head > :nth-child(4), .network-head > :nth-child(5), .network-row > :nth-child(4), .network-row > :nth-child(5) { display: none; }
+      }
+      /* 16px text, below which iOS zooms in on focus. */
+      @media (pointer: coarse) { .repl textarea { font-size: 16px; } }
       @media (forced-colors: active) {
         .network-row[aria-selected="true"] { forced-color-adjust: none; background: Highlight; color: HighlightText; }
         .console-row[data-level="error"] .level { forced-color-adjust: none; color: Mark; }

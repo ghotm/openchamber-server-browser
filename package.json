@@ -1,6 +1,6 @@
 {
   "name": "@josuegalre/openchamber-server-browser",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "private": true,
   "description": "Server-owned Chrome browser provider and shared surface for OpenChamber",
   "type": "module",
@@ -21,11 +21,13 @@
         "icon": "computer",
         "entry": "panel/index.html",
         "dock": "top",
-        "size": 76
+        "size": 76,
+        "mobile": true
       },
       "page": {
         "entry": "panel/inspector.html",
-        "title": "Browser inspector"
+        "title": "Browser inspector",
+        "mobile": true
       },
       "statusSection": {
         "entry": "panel/status.html",
